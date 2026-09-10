@@ -1,0 +1,13 @@
+# Build outputs
+build/
+*.elf
+*.bin
+*.map
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
