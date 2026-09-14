@@ -31,6 +31,7 @@
 #include "can.h"
 #include "sci.h"
 #include "gio.h"
+#include "drivers.h"
 
 #include "telemetry.h"
 
@@ -39,16 +40,22 @@
 /* ---- Configuration ------------------------------------------------- */
 
 #define PRIO_CAN_RX       3U
-#define PRIO_TELEMETRY    2U
+#define PRIO_DRIVERS      2U
+#define PRIO_TELEMETRY    1U
 #define PRIO_SIMULATE_CAN 1U
 
 #define STACK_CAN_RX       256U
+#define STACK_DRIVERS      256U
 #define STACK_TELEMETRY    256U
 #define STACK_SIMULATE_CAN 256U
 
 #define CAN_RX_PERIOD_MS      10U
+#define DRIVERS_PERIOD_MS     10U
 #define TELEMETRY_PERIOD_MS  100U
 #define SIMULATE_PERIOD_MS   200U
+
+#define CALIBRATION_CMD_START 7U
+#define CALIBRATION_CMD_STOP  8U
 
 /* ---- Little-endian CAN payload decoding helpers ---------------------- */
 
@@ -79,6 +86,9 @@ static StaticSemaphore_t xTelemetryMutexBuffer;
 
 static StaticTask_t xCanRxTaskBuffer;
 static StackType_t xCanRxStack[ STACK_CAN_RX ];
+
+static StaticTask_t xDriversTaskBuffer;
+static StackType_t xDriversStack[ STACK_DRIVERS ];
 
 static StaticTask_t xTelemetryTaskBuffer;
 static StackType_t xTelemetryStack[ STACK_TELEMETRY ];
@@ -390,6 +400,48 @@ static portTASK_FUNCTION( vTelemetryTask, pvParameters )
     }
 }
 
+static portTASK_FUNCTION( vDriversTask, pvParameters )
+{
+    bool bStartRequested = false;
+    int16_t s16Torque = 0;
+    ( void ) pvParameters;
+
+    for( ;; )
+    {
+        xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
+
+        /* CAN ID 0x600 (calibration): Byte 0 == 7 -> Start, Byte 0 == 8 -> Stop */
+        if( xTelemetryData.calibration_valid )
+        {
+            if( xTelemetryData.calibration_type == CALIBRATION_CMD_START )
+            {
+                bStartRequested = true;
+            }
+            else if( xTelemetryData.calibration_type == CALIBRATION_CMD_STOP )
+            {
+                bStartRequested = false;
+            }
+        }
+
+        /* Torque is the average between APPS1 (tps1) and APPS2 (tps2) */
+        if( xTelemetryData.sensors_valid )
+        {
+            uint32_t ulAvgTps = ( ( uint32_t ) xTelemetryData.sensors.tps1 + ( uint32_t ) xTelemetryData.sensors.tps2 ) / 2U;
+            s16Torque = ( int16_t ) ulAvgTps;
+        }
+        else
+        {
+            s16Torque = 0;
+        }
+
+        xSemaphoreGive( xTelemetryMutex );
+
+        run_drivers( bStartRequested, s16Torque );
+
+        vTaskDelay( pdMS_TO_TICKS( DRIVERS_PERIOD_MS ) );
+    }
+}
+
 /* ---- Static allocation callbacks required by configSUPPORT_STATIC_ALLOCATION */
 
 void vApplicationGetIdleTaskMemory( StaticTask_t **ppxIdleTaskTCBBuffer,
@@ -432,8 +484,13 @@ int main( void )
     xTelemetryMutex = xSemaphoreCreateMutexStatic( &xTelemetryMutexBuffer );
     configASSERT( xTelemetryMutex != NULL );
 
+    init_drivers();
+
     xTaskCreateStatic( vCanRxTask, "CanRx", STACK_CAN_RX, NULL,
                         PRIO_CAN_RX, xCanRxStack, &xCanRxTaskBuffer );
+
+    xTaskCreateStatic( vDriversTask, "Drivers", STACK_DRIVERS, NULL,
+                        PRIO_DRIVERS, xDriversStack, &xDriversTaskBuffer );
 
     xTaskCreateStatic( vTelemetryTask, "Telemetry", STACK_TELEMETRY, NULL,
                         PRIO_TELEMETRY, xTelemetryStack, &xTelemetryTaskBuffer );
