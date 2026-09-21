@@ -2,7 +2,17 @@
 build/
 *.elf
 *.bin
+*.out
 *.map
+Debug/
+.settings/
+.launches/
+targetConfigs/
+.ccsproject
+.cproject
+.project
+build.bat
+
 
 # Editor / IDE
 .vscode/

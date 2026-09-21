@@ -65,6 +65,7 @@ all: $(TARGET).elf
 $(TARGET).elf: $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $^ -lgcc -lc -lm -lnosys
 	$(OBJCOPY) -O binary $(TARGET).elf $(TARGET).bin
+	cp $(TARGET).elf $(TARGET).out
 
 build/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -82,4 +83,4 @@ docker-build:
 	docker run --rm -v "$(CURDIR):/project" -w /project $(DOCKER_IMAGE) make
 
 clean:
-	rm -rf build $(TARGET).elf $(TARGET).bin $(TARGET).map
+	rm -rf build $(TARGET).elf $(TARGET).bin $(TARGET).out $(TARGET).map

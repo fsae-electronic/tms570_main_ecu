@@ -43,16 +43,19 @@
 #define PRIO_DRIVERS      2U
 #define PRIO_TELEMETRY    1U
 #define PRIO_SIMULATE_CAN 1U
+#define PRIO_HEARTBEAT    1U
 
 #define STACK_CAN_RX       256U
 #define STACK_DRIVERS      256U
 #define STACK_TELEMETRY    256U
 #define STACK_SIMULATE_CAN 256U
+#define STACK_HEARTBEAT    128U
 
 #define CAN_RX_PERIOD_MS      10U
 #define DRIVERS_PERIOD_MS     10U
 #define TELEMETRY_PERIOD_MS  100U
 #define SIMULATE_PERIOD_MS   200U
+#define HEARTBEAT_PERIOD_MS  100U
 
 #define CALIBRATION_CMD_START 7U
 #define CALIBRATION_CMD_STOP  8U
@@ -92,6 +95,9 @@ static StackType_t xDriversStack[ STACK_DRIVERS ];
 
 static StaticTask_t xTelemetryTaskBuffer;
 static StackType_t xTelemetryStack[ STACK_TELEMETRY ];
+
+static StaticTask_t xHeartbeatTaskBuffer;
+static StackType_t xHeartbeatStack[ STACK_HEARTBEAT ];
 
 #ifdef BENCH_TEST_SIMULATE_CAN
 static StaticTask_t xSimulateTaskBuffer;
@@ -216,6 +222,19 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
                           canMESSAGE_BOX21, canMESSAGE_BOX23 );
 
         vTaskDelay( pdMS_TO_TICKS( CAN_RX_PERIOD_MS ) );
+    }
+}
+
+/* Debug aid: pulses SCI TX continuously so a scope/LED on the TX line
+ * shows the scheduler is alive, independent of CAN/telemetry state. */
+static portTASK_FUNCTION( vHeartbeatTask, pvParameters )
+{
+    ( void ) pvParameters;
+
+    for( ;; )
+    {
+        sciSend( sciREG, 1U, ( uint8 * ) "." );
+        vTaskDelay( pdMS_TO_TICKS( HEARTBEAT_PERIOD_MS ) );
     }
 }
 
@@ -494,6 +513,9 @@ int main( void )
 
     xTaskCreateStatic( vTelemetryTask, "Telemetry", STACK_TELEMETRY, NULL,
                         PRIO_TELEMETRY, xTelemetryStack, &xTelemetryTaskBuffer );
+
+    xTaskCreateStatic( vHeartbeatTask, "Heartbeat", STACK_HEARTBEAT, NULL,
+                        PRIO_HEARTBEAT, xHeartbeatStack, &xHeartbeatTaskBuffer );
 
 #ifdef BENCH_TEST_SIMULATE_CAN
     xTaskCreateStatic( vSimulateCanTask, "SimCan", STACK_SIMULATE_CAN, NULL,
