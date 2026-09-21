@@ -28,8 +28,8 @@
 /* Driver PDO IDs are base + node, node 1 = left, node 2 = right. */
 #define CAN_ID_RXPDO1_BASE   0x200U /* control word / target torque (commanded) */
 #define CAN_ID_TXPDO1_BASE   0x180U /* status word / warnings / error */
-#define CAN_ID_TXPDO2_BASE   0x280U /* motor velocity / rated current / temp */
-#define CAN_ID_TXPDO3_BASE   0x380U /* driver temp / DC bus voltage */
+#define CAN_ID_TXPDO2_BASE   0x280U /* motor velocity / rated current */
+#define CAN_ID_TXPDO3_BASE   0x380U /* driver temp / DC bus voltage / motor temp */
 #define CAN_ID_HEARTBEAT_BASE 0x700U /* CANopen NMT state */
 
 typedef struct
@@ -73,7 +73,7 @@ typedef struct
     uint16_t error;
     bool     txpdo1_valid;
 
-    uint16_t motor_velocity;
+    int32_t  motor_velocity;
     uint32_t motor_rated_current;
     uint8_t  motor_temp;
     bool     txpdo2_valid;
@@ -100,6 +100,7 @@ typedef struct
     RearData_t      rear;
     bool            rear_valid;
     uint8_t         calibration_type;
+    uint8_t         calibration_value;
     bool            calibration_valid;
     DriverNode_t    driver[ 2 ]; /* [0] = left/node1, [1] = right/node2 */
 } TelemetrySnapshot_t;

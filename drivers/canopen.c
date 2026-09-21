@@ -11,9 +11,14 @@
 #define CANOPEN_NMT_TX_MAILBOX canMESSAGE_BOX5
 #define CANOPEN_SDO_TX_MAILBOX canMESSAGE_BOX6
 #define CANOPEN_PDO_TX_MAILBOX canMESSAGE_BOX8
-#define CANOPEN_RX_MAILBOX canMESSAGE_BOX16
-#define CANOPEN_STANDARD_TX_ARB(id) (0x20000000U | ((uint32)(id) & 0x7FFU))
-#define CANOPEN_STANDARD_RX_ARB(id) ((uint32)(id) & 0x7FFU)
+/* Box 16 is telemetry's TXPDO2 (node 1) RX mailbox (see can.c/telemetry.h)
+ * -- using it here too would let canopen_prepare_sdo_response() silently
+ * repoint it away from 0x281 out from under the telemetry poll loop. */
+#define CANOPEN_RX_MAILBOX canMESSAGE_BOX9
+/* Xtd stays clear (standard 11-bit COB-IDs) and the identifier goes into
+ * bits 28:18 of IFxARB -- see canSTD_ID() in can.h. */
+#define CANOPEN_STANDARD_TX_ARB(id) (0x20000000U | canSTD_ID(id))
+#define CANOPEN_STANDARD_RX_ARB(id) (canSTD_ID(id))
 
 static bool canopen_transmit(uint32 mailbox, uint16_t id, const uint8_t *data)
 {
@@ -196,7 +201,7 @@ int32_t recive_sdo_read_command(uint8_t command, uint16_t od_index, uint8_t od_s
  * @return void
  */
 void send_nmt_command(uint8_t command, uint16_t node_id) {
-	uint8_t nmt_data[2];
+	uint8_t nmt_data[8] = {0U};
 	nmt_data[0] = command; // NMT command (0x01 for Operational, 0x80 for Pre-operational)
 	nmt_data[1] = (uint8_t) node_id;  // Node ID of the slave
 

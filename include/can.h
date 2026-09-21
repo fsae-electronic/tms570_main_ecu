@@ -610,6 +610,23 @@ typedef enum canloopBackType
 }canloopBackType_t;
 
 /* USER CODE BEGIN (1) */
+
+/* Standard (11-bit) identifier helpers.
+ *
+ * DCAN stores identifiers left-aligned in the IFxARB / IFxMSK registers: an
+ * extended (29-bit) ID occupies bits 28:0, while a standard (11-bit) ID sits
+ * in bits 28:18. The Xtd bit (bit 30 of IFxARB) selects which form a message
+ * object uses; this project is standard-ID only, so Xtd is always left clear
+ * and every ID has to be shifted into place with canSTD_ID().
+ */
+#define canID_STD_SHIFT  18U
+
+/** Places an 11-bit identifier where IFxARB/IFxMSK expect it. */
+#define canSTD_ID(id)    ((uint32)((uint32)(id) & 0x7FFU) << canID_STD_SHIFT)
+
+/** IFxMSK value that filters on the full 11-bit ID (MXtd | MDir | ID mask). */
+#define canSTD_ID_MSK    (0xC0000000U | canSTD_ID(0x7FFU))
+
 /* USER CODE END */
 
 /* Configuration registers */

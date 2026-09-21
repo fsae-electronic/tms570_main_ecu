@@ -18,10 +18,6 @@
  * All multi-byte CAN signal fields are little-endian on the wire (B0 =
  * LSB) -- see telemetry.h for why that's now confirmed rather than
  * assumed.
- *
- * Define BENCH_TEST_SIMULATE_CAN (see Makefile) to run a task that feeds
- * synthetic values into the same snapshot, for testing the pipeline
- * without any CAN hardware connected.
  */
 
 #include "FreeRTOS.h"
@@ -42,23 +38,18 @@
 #define PRIO_CAN_RX       3U
 #define PRIO_DRIVERS      2U
 #define PRIO_TELEMETRY    1U
-#define PRIO_SIMULATE_CAN 1U
-#define PRIO_HEARTBEAT    1U
 
 #define STACK_CAN_RX       256U
 #define STACK_DRIVERS      256U
 #define STACK_TELEMETRY    256U
-#define STACK_SIMULATE_CAN 256U
-#define STACK_HEARTBEAT    128U
 
 #define CAN_RX_PERIOD_MS      10U
 #define DRIVERS_PERIOD_MS     10U
 #define TELEMETRY_PERIOD_MS  100U
-#define SIMULATE_PERIOD_MS   200U
-#define HEARTBEAT_PERIOD_MS  100U
 
-#define CALIBRATION_CMD_START 7U
-#define CALIBRATION_CMD_STOP  8U
+#define CALIBRATION_CMD_DRIVE_ENABLE_ON  7U
+#define CALIBRATION_CMD_DRIVE_ENABLE_OFF 8U
+#define CALIBRATION_CMD_TELEMETRY 0xAU
 
 /* ---- Little-endian CAN payload decoding helpers ---------------------- */
 
@@ -80,10 +71,16 @@ static uint32_t leU32( const uint8 *p )
          | ( ( uint32_t ) p[ 3 ] << 24 );
 }
 
+static int32_t leI32( const uint8 *p )
+{
+    return ( int32_t ) leU32( p );
+}
+
 /* ---- Shared state ---------------------------------------------------*/
 
 TelemetrySnapshot_t xTelemetryData;
 SemaphoreHandle_t xTelemetryMutex;
+static bool xTelemetryEnabled = true;
 
 static StaticSemaphore_t xTelemetryMutexBuffer;
 
@@ -95,14 +92,6 @@ static StackType_t xDriversStack[ STACK_DRIVERS ];
 
 static StaticTask_t xTelemetryTaskBuffer;
 static StackType_t xTelemetryStack[ STACK_TELEMETRY ];
-
-static StaticTask_t xHeartbeatTaskBuffer;
-static StackType_t xHeartbeatStack[ STACK_HEARTBEAT ];
-
-#ifdef BENCH_TEST_SIMULATE_CAN
-static StaticTask_t xSimulateTaskBuffer;
-static StackType_t xSimulateStack[ STACK_SIMULATE_CAN ];
-#endif
 
 /* ---- Tasks ------------------------------------------------------------*/
 
@@ -119,8 +108,8 @@ static void vPollDriverNode( uint32 node, uint32 boxTxPdo1, uint32 boxTxPdo2,
     {
         xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
         xTelemetryData.driver[ node ].status_word = leU16( &raw[ 0 ] );
-        xTelemetryData.driver[ node ].warnings    = leU16( &raw[ 4 ] );
-        xTelemetryData.driver[ node ].error       = leU16( &raw[ 6 ] );
+        xTelemetryData.driver[ node ].warnings    = leU16( &raw[ 2 ] );
+        xTelemetryData.driver[ node ].error       = leU16( &raw[ 4 ] );
         xTelemetryData.driver[ node ].txpdo1_valid = true;
         xSemaphoreGive( xTelemetryMutex );
     }
@@ -128,9 +117,8 @@ static void vPollDriverNode( uint32 node, uint32 boxTxPdo1, uint32 boxTxPdo2,
     if( canGetData( canREG1, boxTxPdo2, raw ) != 0U )
     {
         xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
-        xTelemetryData.driver[ node ].motor_velocity     = leU16( &raw[ 0 ] );
-        xTelemetryData.driver[ node ].motor_rated_current = leU32( &raw[ 2 ] );
-        xTelemetryData.driver[ node ].motor_temp         = raw[ 6 ];
+        xTelemetryData.driver[ node ].motor_velocity     = leI32( &raw[ 0 ] );
+        xTelemetryData.driver[ node ].motor_rated_current = leU32( &raw[ 4 ] );
         xTelemetryData.driver[ node ].txpdo2_valid = true;
         xSemaphoreGive( xTelemetryMutex );
     }
@@ -140,6 +128,7 @@ static void vPollDriverNode( uint32 node, uint32 boxTxPdo1, uint32 boxTxPdo2,
         xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
         xTelemetryData.driver[ node ].driver_temp       = raw[ 0 ];
         xTelemetryData.driver[ node ].driver_dc_voltage = leU16( &raw[ 1 ] );
+        xTelemetryData.driver[ node ].motor_temp         = raw[ 3 ];
         xTelemetryData.driver[ node ].txpdo3_valid = true;
         xSemaphoreGive( xTelemetryMutex );
     }
@@ -172,8 +161,8 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
         if( canGetData( canREG1, canMESSAGE_BOX1, raw ) != 0U )
         {
             xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
-            xTelemetryData.sensors.tps1 = leU16( &raw[ 0 ] );
-            xTelemetryData.sensors.tps2 = leU16( &raw[ 2 ] );
+            xTelemetryData.sensors.tps1 = (uint16_t)(raw[ 1 ] | (raw[ 0 ] << 8 ) );
+            xTelemetryData.sensors.tps2 = (uint16_t)(raw[ 3 ] | (raw[ 2 ] << 8 ) );
             xTelemetryData.sensors_valid = true;
             xSemaphoreGive( xTelemetryMutex );
         }
@@ -212,7 +201,12 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
         {
             xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
             xTelemetryData.calibration_type = raw[ 0 ];
+            xTelemetryData.calibration_value = raw[ 1 ];
             xTelemetryData.calibration_valid = true;
+            if( raw[ 0 ] == CALIBRATION_CMD_TELEMETRY )
+            {
+                xTelemetryEnabled = ( raw[ 1 ] != 0U );
+            }
             xSemaphoreGive( xTelemetryMutex );
         }
 
@@ -224,52 +218,6 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
         vTaskDelay( pdMS_TO_TICKS( CAN_RX_PERIOD_MS ) );
     }
 }
-
-/* Debug aid: pulses SCI TX continuously so a scope/LED on the TX line
- * shows the scheduler is alive, independent of CAN/telemetry state. */
-static portTASK_FUNCTION( vHeartbeatTask, pvParameters )
-{
-    ( void ) pvParameters;
-
-    for( ;; )
-    {
-        sciSend( sciREG, 1U, ( uint8 * ) "." );
-        vTaskDelay( pdMS_TO_TICKS( HEARTBEAT_PERIOD_MS ) );
-    }
-}
-
-#ifdef BENCH_TEST_SIMULATE_CAN
-/* Stands in for adc2can_front when no CAN hardware is connected: writes
- * synthetic, slowly-changing values into the same mutex-protected
- * snapshot the real CAN RX task would update, so the rest of the
- * pipeline (rules placeholder + UART framing) can be exercised on the
- * bench. Never touches CAN hardware. */
-static portTASK_FUNCTION( vSimulateCanTask, pvParameters )
-{
-    uint16_t counter = 0U;
-    ( void ) pvParameters;
-
-    for( ;; )
-    {
-        xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
-
-        xTelemetryData.sensors.tps1 = ( uint16_t ) ( 1000U + ( counter % 500U ) );
-        xTelemetryData.sensors.tps2 = ( uint16_t ) ( 1200U + ( counter % 300U ) );
-        xTelemetryData.sensors_valid = true;
-
-        xTelemetryData.front_axle.wheel_speed_fl = ( uint16_t ) ( 2000U + counter );
-        xTelemetryData.front_axle.wheel_speed_fr = ( uint16_t ) ( 2010U + counter );
-        xTelemetryData.front_axle.steering_angle = ( uint16_t ) ( 500U + ( counter % 100U ) );
-        xTelemetryData.front_axle.front_brake    = ( uint16_t ) ( 300U + ( counter % 50U ) );
-        xTelemetryData.front_axle_valid = true;
-
-        xSemaphoreGive( xTelemetryMutex );
-
-        counter++;
-        vTaskDelay( pdMS_TO_TICKS( SIMULATE_PERIOD_MS ) );
-    }
-}
-#endif /* BENCH_TEST_SIMULATE_CAN */
 
 /* ---- Wire frame -------------------------------------------------------
  *
@@ -294,14 +242,14 @@ static portTASK_FUNCTION( vSimulateCanTask, pvParameters )
  *   23      2     dc_current_2
  *   25      2     rear_brake
  *   27      1     calibration_type
- *   28      ...   per driver node (left then right), 21 bytes each:
+ *   28      ...   per driver node (left then right), 23 bytes each:
  *                   control_word(2) target_torque(2) status_word(2)
- *                   warnings(2) error(2) motor_velocity(2)
- *                   motor_rated_current(4) motor_temp(1) driver_temp(1)
- *                   driver_dc_voltage(2) heartbeat_state(1)
- *   70      --    end
+ *                   warnings(2) error(2) motor_velocity(4)
+ *                   motor_rated_current(4) driver_temp(1)
+ *                   driver_dc_voltage(2) motor_temp(1) heartbeat_state(1)
+ *   74      --    end
  */
-#define TELEMETRY_FRAME_SIZE 70U
+#define TELEMETRY_FRAME_SIZE 74U
 
 #define TELEMETRY_VALID_TPS        ( 1U << 0 )
 #define TELEMETRY_VALID_FRONT      ( 1U << 1 )
@@ -387,11 +335,11 @@ static void vPackFrame( const TelemetrySnapshot_t *pxSnapshot, uint8_t *pxFrame 
         putU16( pxFrame, &idx, pxNode->status_word );
         putU16( pxFrame, &idx, pxNode->warnings );
         putU16( pxFrame, &idx, pxNode->error );
-        putU16( pxFrame, &idx, pxNode->motor_velocity );
+        putU32( pxFrame, &idx, ( uint32_t ) pxNode->motor_velocity );
         putU32( pxFrame, &idx, pxNode->motor_rated_current );
-        putU8( pxFrame, &idx, pxNode->motor_temp );
         putU8( pxFrame, &idx, pxNode->driver_temp );
         putU16( pxFrame, &idx, pxNode->driver_dc_voltage );
+        putU8( pxFrame, &idx, pxNode->motor_temp );
         putU8( pxFrame, &idx, pxNode->heartbeat_state );
     }
 }
@@ -400,6 +348,7 @@ static portTASK_FUNCTION( vTelemetryTask, pvParameters )
 {
     TelemetrySnapshot_t xSnapshot;
     uint8_t xFrame[ TELEMETRY_FRAME_SIZE ];
+    bool bTelemetryEnabled;
     ( void ) pvParameters;
 
     for( ;; )
@@ -409,6 +358,15 @@ static portTASK_FUNCTION( vTelemetryTask, pvParameters )
         xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
         xSnapshot = xTelemetryData;
         xSemaphoreGive( xTelemetryMutex );
+
+        xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
+        bTelemetryEnabled = xTelemetryEnabled;
+        xSemaphoreGive( xTelemetryMutex );
+
+        if( !bTelemetryEnabled )
+        {
+            continue;
+        }
 
         /* TODO: SAE compliance rules go here, between reading the
          * snapshot and sending it -- deliberately not implemented yet.
@@ -421,7 +379,7 @@ static portTASK_FUNCTION( vTelemetryTask, pvParameters )
 
 static portTASK_FUNCTION( vDriversTask, pvParameters )
 {
-    bool bStartRequested = false;
+    bool bDriveEnabled = false;
     int16_t s16Torque = 0;
     ( void ) pvParameters;
 
@@ -429,16 +387,16 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
     {
         xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
 
-        /* CAN ID 0x600 (calibration): Byte 0 == 7 -> Start, Byte 0 == 8 -> Stop */
+        /* CAN ID 0x600: Byte 0 is the command id. */
         if( xTelemetryData.calibration_valid )
         {
-            if( xTelemetryData.calibration_type == CALIBRATION_CMD_START )
+            if( xTelemetryData.calibration_type == CALIBRATION_CMD_DRIVE_ENABLE_ON )
             {
-                bStartRequested = true;
+                bDriveEnabled = true;
             }
-            else if( xTelemetryData.calibration_type == CALIBRATION_CMD_STOP )
+            else if( xTelemetryData.calibration_type == CALIBRATION_CMD_DRIVE_ENABLE_OFF )
             {
-                bStartRequested = false;
+                bDriveEnabled = false;
             }
         }
 
@@ -455,7 +413,7 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
 
         xSemaphoreGive( xTelemetryMutex );
 
-        run_drivers( bStartRequested, s16Torque );
+        run_drivers( bDriveEnabled, s16Torque );
 
         vTaskDelay( pdMS_TO_TICKS( DRIVERS_PERIOD_MS ) );
     }
@@ -513,14 +471,6 @@ int main( void )
 
     xTaskCreateStatic( vTelemetryTask, "Telemetry", STACK_TELEMETRY, NULL,
                         PRIO_TELEMETRY, xTelemetryStack, &xTelemetryTaskBuffer );
-
-    xTaskCreateStatic( vHeartbeatTask, "Heartbeat", STACK_HEARTBEAT, NULL,
-                        PRIO_HEARTBEAT, xHeartbeatStack, &xHeartbeatTaskBuffer );
-
-#ifdef BENCH_TEST_SIMULATE_CAN
-    xTaskCreateStatic( vSimulateCanTask, "SimCan", STACK_SIMULATE_CAN, NULL,
-                        PRIO_SIMULATE_CAN, xSimulateStack, &xSimulateTaskBuffer );
-#endif
 
     vTaskStartScheduler();
 

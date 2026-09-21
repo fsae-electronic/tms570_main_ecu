@@ -51,10 +51,6 @@ Or, with the toolchain installed natively at `/opt/arm-none-eabi-be`:
 make
 ```
 
-`BENCH_TEST_SIMULATE_CAN=1 make` builds with a synthetic CAN-data
-generator task instead of relying on real CAN hardware, for bench
-testing the SCI pipeline alone.
-
 ## Flashing (SEGGER J-Link)
 
 ```bash
@@ -76,7 +72,7 @@ qc
 
 ## Telemetry frame
 
-`vPackFrame()` in `app/main.c` sends a 70-byte little-endian frame over
+`vPackFrame()` in `app/main.c` sends a 74-byte little-endian frame over
 SCI at 115200 baud, every 100 ms:
 
 ```
@@ -96,12 +92,12 @@ offset  size  field
 23      2     dc_current_2
 25      2     rear_brake
 27      1     calibration_type
-28      21    driver[0] (left):  control_word(2) target_torque(2)
-              status_word(2) warnings(2) error(2) motor_velocity(2)
-              motor_rated_current(4) motor_temp(1) driver_temp(1)
-              driver_dc_voltage(2) heartbeat_state(1)
-49      21    driver[1] (right), same layout as driver[0]
-70      --    end
+28      23    driver[0] (left):  control_word(2) target_torque(2)
+              status_word(2) warnings(2) error(2) motor_velocity(4)
+              motor_rated_current(4) driver_temp(1) driver_dc_voltage(2)
+              motor_temp(1) heartbeat_state(1)
+51      23    driver[1] (right), same layout as driver[0]
+74      --    end
 ```
 
 `tools/decode_telemetry.py` decodes and prints this stream directly off

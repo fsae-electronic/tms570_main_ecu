@@ -1,5 +1,8 @@
 #include "drivers.h"
 
+#include "FreeRTOS.h"
+#include "os_task.h"
+
 #include "canopen.h"
 
 #define DRIVER_NODE_1 1U
@@ -11,14 +14,24 @@
 #define CONTROLWORD_SWITCH_ON 0x0007U
 #define CONTROLWORD_ENABLE_OPERATION 0x000FU
 
+/* Gap between the frames of the init sequence: the drives only service
+ * their own RPDO1 mailbox once per control cycle, so back-to-back frames
+ * with no gap at all can overwrite each other there before the drive
+ * reads them -- it only ever sees the last one. */
+#define INIT_STEP_GAP_MS 5U
+
+/* Torque RPDO rate once a drive is in DRIVE: run_drivers() itself is
+ * polled much faster (see DRIVERS_PERIOD_MS in main.c) so the state
+ * machine stays responsive, but sending torque at that same rate for both
+ * nodes was needlessly loading the bus -- 25 Hz is plenty for a torque
+ * setpoint. */
+#define TORQUE_SEND_PERIOD_MS 40U
+
 typedef enum
 {
-    DRIVER_STATE_OFF,
-    DRIVER_STATE_PRE_OPERATIONAL,
-    DRIVER_STATE_OPERATIONAL,
-    DRIVER_STATE_SHUTDOWN,
-    DRIVER_STATE_SWITCHED_ON,
-    DRIVER_STATE_ENABLED
+    DRIVER_STATE_INITIALIZING,
+    DRIVER_STATE_DRIVE,
+    DRIVER_STATE_STOP
 } DriverState_t;
 
 typedef struct
@@ -56,51 +69,37 @@ static void stop_drivers(void)
 
     for (index = 0U; index < 2U; index++)
     {
-        if (s_drivers[index].state != DRIVER_STATE_OFF)
+        if (s_drivers[index].state != DRIVER_STATE_STOP)
         {
-            (void)send_controlword(s_drivers[index].node_id, CONTROLWORD_DISABLE_VOLTAGE);
             send_nmt_command(NMT_CMD_ENTER_PRE_OPERATIONAL, s_drivers[index].node_id);
-            s_drivers[index].state = DRIVER_STATE_OFF;
+            s_drivers[index].state = DRIVER_STATE_STOP;
         }
     }
 }
 
+/* Runs the whole OPERATIONAL -> CiA-402 enable sequence, pacing each frame
+ * INIT_STEP_GAP_MS apart, and moves straight to DRIVE. */
 static void advance_driver(DriverChannel_t *driver)
 {
     switch (driver->state)
     {
-    case DRIVER_STATE_OFF:
-        send_nmt_command(NMT_CMD_ENTER_PRE_OPERATIONAL, driver->node_id);
-        driver->state = DRIVER_STATE_PRE_OPERATIONAL;
-        break;
-
-    case DRIVER_STATE_PRE_OPERATIONAL:
+    case DRIVER_STATE_INITIALIZING:
+        // send_nmt_command(NMT_CMD_ENTER_PRE_OPERATIONAL, driver->node_id);
         send_nmt_command(NMT_CMD_ENTER_OPERATIONAL, driver->node_id);
-        driver->state = DRIVER_STATE_OPERATIONAL;
+        vTaskDelay(pdMS_TO_TICKS(INIT_STEP_GAP_MS));
+        (void)send_controlword(driver->node_id, CONTROLWORD_SHUTDOWN);
+        vTaskDelay(pdMS_TO_TICKS(INIT_STEP_GAP_MS));
+        (void)send_controlword(driver->node_id, CONTROLWORD_SWITCH_ON);
+        vTaskDelay(pdMS_TO_TICKS(INIT_STEP_GAP_MS));
+        (void)send_controlword(driver->node_id, CONTROLWORD_ENABLE_OPERATION);
+        driver->state = DRIVER_STATE_DRIVE;
         break;
 
-    case DRIVER_STATE_OPERATIONAL:
-        if (send_controlword(driver->node_id, CONTROLWORD_SHUTDOWN))
-        {
-            driver->state = DRIVER_STATE_SHUTDOWN;
-        }
+    case DRIVER_STATE_DRIVE:
+        /* Torque is sent from run_drivers() below. */
         break;
 
-    case DRIVER_STATE_SHUTDOWN:
-        if (send_controlword(driver->node_id, CONTROLWORD_SWITCH_ON))
-        {
-            driver->state = DRIVER_STATE_SWITCHED_ON;
-        }
-        break;
-
-    case DRIVER_STATE_SWITCHED_ON:
-        if (send_controlword(driver->node_id, CONTROLWORD_ENABLE_OPERATION))
-        {
-            driver->state = DRIVER_STATE_ENABLED;
-        }
-        break;
-
-    case DRIVER_STATE_ENABLED:
+    case DRIVER_STATE_STOP:
     default:
         break;
     }
@@ -109,36 +108,43 @@ static void advance_driver(DriverChannel_t *driver)
 void init_drivers(void)
 {
     s_drivers[0].node_id = DRIVER_NODE_1;
-    s_drivers[0].state = DRIVER_STATE_OFF;
+    s_drivers[0].state = DRIVER_STATE_STOP;
     s_drivers[1].node_id = DRIVER_NODE_2;
-    s_drivers[1].state = DRIVER_STATE_OFF;
+    s_drivers[1].state = DRIVER_STATE_STOP;
 }
 
-void run_drivers(bool start_requested, int16_t torque_request)
+void run_drivers(bool drive_enabled, int16_t torque_request)
 {
     uint32_t index;
-    bool drivers_enabled = true;
+    static TickType_t s_last_torque_tick = 0U;
+    TickType_t now;
+    bool send_torque_now;
 
-    if (!start_requested)
+    if (!drive_enabled)
     {
         stop_drivers();
         return;
     }
 
-    for (index = 0U; index < 2U; index++)
+    now = xTaskGetTickCount();
+    send_torque_now = ( ( now - s_last_torque_tick ) >= pdMS_TO_TICKS( TORQUE_SEND_PERIOD_MS ) );
+    if (send_torque_now)
     {
-        advance_driver(&s_drivers[index]);
-        if (s_drivers[index].state != DRIVER_STATE_ENABLED)
-        {
-            drivers_enabled = false;
-        }
+        s_last_torque_tick = now;
     }
 
-    if (drivers_enabled)
+    for (index = 0U; index < 2U; index++)
     {
-        for (index = 0U; index < 2U; index++)
+        if (s_drivers[index].state == DRIVER_STATE_STOP)
         {
-            (void)send_torque(s_drivers[index].node_id, torque_request);
+            s_drivers[index].state = DRIVER_STATE_INITIALIZING;
+        }
+
+        advance_driver(&s_drivers[index]);
+
+        if ((s_drivers[index].state == DRIVER_STATE_DRIVE) && send_torque_now)
+        {
+            (void)send_torque(s_drivers[index].node_id, (int16_t)(-10)*torque_request);
         }
     }
 }

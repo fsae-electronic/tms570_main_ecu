@@ -70,13 +70,14 @@
 /* USER CODE BEGIN (2) */
 /* USER CODE END */
 
-/* Configures message box `boxNum` on canREG1 as an extended-ID RX mailbox
- * for `id`, using IF2 for the one-time config write (IF2 vs IF1 makes no
- * difference here -- both are just staging registers into message RAM;
- * canGetData() always reads back via IF2 regardless of which interface a
- * box was configured through). Every ID this driver cares about fits in
- * 11 bits, so the same 0x7FF mask works for all of them, same as the
- * hand-written mailboxes above. */
+/* Configures message box `boxNum` on canREG1 as a standard-ID (11-bit) RX
+ * mailbox for `id`, using IF2 for the one-time config write (IF2 vs IF1
+ * makes no difference here -- both are just staging registers into message
+ * RAM; canGetData() always reads back via IF2 regardless of which
+ * interface a box was configured through). Xtd (bit 30 of ARB/MSK) is left
+ * clear and the ID is shifted into bits 28:18 via canSTD_ID() -- see the
+ * comment on that macro in can.h. Every ID this driver cares about fits in
+ * 11 bits, so canSTD_ID_MSK works for all of them. */
 static void canConfigureRxMailbox( uint32 boxNum, uint32 id )
 {
     /*SAFETYMCUSW 28 D MR:NA <APPROVED> "Potentially infinite loop found - Hardware Status check for execution sequence" */
@@ -84,11 +85,30 @@ static void canConfigureRxMailbox( uint32 boxNum, uint32 id )
     {
     } /* Wait */
 
-    canREG1->IF2MSK  = 0xC0000000U | ( uint32 ) 0x000007FFU;
-    canREG1->IF2ARB  = 0x80000000U | 0x40000000U | 0x00000000U | ( id & 0x1FFFFFFFU );
+    canREG1->IF2MSK  = canSTD_ID_MSK;
+    canREG1->IF2ARB  = 0x80000000U | canSTD_ID( id );
     canREG1->IF2MCTL = 0x00001000U | 0x00000400U | 8U;
     canREG1->IF2CMD  = ( uint8 ) 0xF8U;
     canREG1->IF2NO   = ( uint8 ) boxNum;
+}
+
+/* Same as canConfigureRxMailbox() but for a standard-ID TX mailbox (Dir=1),
+ * via IF1. Used for the CANopen TX boxes (NMT/SDO/PDO): their real COB-ID
+ * is set per-message at send time via canUpdateID(), so `id` here is just
+ * a valid placeholder -- what matters is that the box is marked valid,
+ * standard-ID, TX, DLC 8. */
+static void canConfigureTxMailbox( uint32 boxNum, uint32 id )
+{
+    /*SAFETYMCUSW 28 D MR:NA <APPROVED> "Potentially infinite loop found - Hardware Status check for execution sequence" */
+    while ( ( canREG1->IF1STAT & 0x80U ) == 0x80U )
+    {
+    } /* Wait */
+
+    canREG1->IF1MSK  = canSTD_ID_MSK;
+    canREG1->IF1ARB  = 0x80000000U | 0x20000000U | canSTD_ID( id );
+    canREG1->IF1MCTL = 0x00001000U | 8U;
+    canREG1->IF1CMD  = ( uint8 ) 0xF8U;
+    canREG1->IF1NO   = ( uint8 ) boxNum;
 }
 
 /** @fn void canInit(void)
@@ -214,149 +234,32 @@ void canInit(void)
     /** - Setup auto bus on timer period */
     canREG1->ABOTR = (uint32)0U;
 
-    /** - Initialize message 1 
-    *     - Wait until IF1 is ready for use 
-    *     - Set message mask
-    *     - Set message control word
-    *     - Set message arbitration
-    *     - Set IF1 control byte
-    *     - Set IF1 message number
-    */
-    /*SAFETYMCUSW 28 D MR:NA <APPROVED> "Potentially infinite loop found - Hardware Status check for execution sequence" */
-    while ((canREG1->IF1STAT & 0x80U) ==0x80U)
-    { 
-    } /* Wait */
+    /* Message boxes 1-24: every mailbox this ECU cares about, all standard
+     * 11-bit IDs (Xtd clear, ID shifted into bits 28:18 via canSTD_ID() --
+     * see canConfigureRxMailbox()/canConfigureTxMailbox() in this file and
+     * the canSTD_ID() comment in can.h). Boxes 5/6/8 carry their real
+     * COB-ID set dynamically per-message by canopen.c via canUpdateID(),
+     * so the ID passed here is just a valid placeholder.
+     *
+     *   1        RX  0x501  CAN_ID_TPS_DATA      (adc2can_front)
+     *   2        RX  0x502  CAN_ID_FRONT_DATA    (adc2can_front)
+     *   5        TX  --     CANopen NMT (CANOPEN_NMT_TX_MAILBOX)
+     *   6        TX  --     CANopen SDO (CANOPEN_SDO_TX_MAILBOX)
+     *   8        TX  --     CANopen PDO (CANOPEN_PDO_TX_MAILBOX)
+     *   9        RX  --     CANopen generic RX (CANOPEN_RX_MAILBOX)
+     *   12-24    RX  --     telemetry (see table below)
+     *
+     * See telemetry.h for the ID definitions and the "Mensajes CAN" spec
+     * doc (mirrored in can-logger/cansniff/messages.py) for the field
+     * layout. */
+    canConfigureRxMailbox( 1U, CAN_ID_TPS_DATA );
+    canConfigureRxMailbox( 2U, CAN_ID_FRONT_DATA );
 
+    canConfigureTxMailbox( 5U, 0x000U );
+    canConfigureTxMailbox( 6U, 0x000U );
+    canConfigureTxMailbox( 8U, 0x000U );
+    canConfigureRxMailbox( 9U, 0x000U );
 
-    /* CAN ID 0x501: TPS data, transmitted by the adc2can_front sensor board (mailbox 2 there). */
-    canREG1->IF1MSK  = 0xC0000000U | (uint32)((uint32)((uint32)0x000007FFU & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF1ARB  = (uint32)0x80000000U | (uint32)0x40000000U | (uint32)0x00000000U | (uint32)((uint32)((uint32)0x501U & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF1MCTL = 0x00001000U | (uint32)0x00000400U | (uint32)0x00000000U | (uint32)0x00000000U | (uint32)8U;
-    canREG1->IF1CMD  = (uint8) 0xF8U;
-    canREG1->IF1NO   = 1U;
-
-    /** - Initialize message 2 
-    *     - Wait until IF2 is ready for use 
-    *     - Set message mask
-    *     - Set message control word
-    *     - Set message arbitration
-    *     - Set IF2 control byte
-    *     - Set IF2 message number
-    */
-    /*SAFETYMCUSW 28 D MR:NA <APPROVED> "Potentially infinite loop found - Hardware Status check for execution sequence" */
-    while ((canREG1->IF2STAT & 0x80U) ==0x80U)
-    { 
-    } /* Wait */
-
-    /* CAN ID 0x502: front wheel speed/steering/brake data, transmitted by adc2can_front (mailbox 3 there). */
-    canREG1->IF2MSK  = 0xC0000000U | (uint32)((uint32)((uint32)0x000007FFU & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF2ARB  = (uint32)0x80000000U | (uint32)0x40000000U | (uint32)0x00000000U | (uint32)((uint32)((uint32)0x502U & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF2MCTL = 0x00001000U | (uint32)0x00000400U | (uint32)0x00000000U | (uint32)0x00000000U | (uint32)8U;
-    canREG1->IF2CMD  = (uint8) 0xF8U;
-    canREG1->IF2NO   = 2U;
-
-    /** - Initialize message 3 
-    *     - Wait until IF1 is ready for use 
-    *     - Set message mask
-    *     - Set message control word
-    *     - Set message arbitration
-    *     - Set IF1 control byte
-    *     - Set IF1 message number
-    */
-    /*SAFETYMCUSW 28 D MR:NA <APPROVED> "Potentially infinite loop found - Hardware Status check for execution sequence" */
-    while ((canREG1->IF1STAT & 0x80U) ==0x80U)
-    { 
-    } /* Wait */
-
-    canREG1->IF1MSK  = 0xC0000000U | (uint32)((uint32)((uint32)0x000007FFU & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF1ARB  = (uint32)0x80000000U | (uint32)0x40000000U | (uint32)0x20000000U | (uint32)((uint32)((uint32)3U & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF1MCTL = 0x00001000U | (uint32)0x00000000U | (uint32)0x00000000U | (uint32)0x00000000U | (uint32)8U;
-    canREG1->IF1CMD  = (uint8) 0xF8U;
-    canREG1->IF1NO   = 3U;
-
-    /** - Initialize message 4 
-    *     - Wait until IF2 is ready for use 
-    *     - Set message mask
-    *     - Set message control word
-    *     - Set message arbitration
-    *     - Set IF2 control byte
-    *     - Set IF2 message number
-    */
-    /*SAFETYMCUSW 28 D MR:NA <APPROVED> "Potentially infinite loop found - Hardware Status check for execution sequence" */
-    while ((canREG1->IF2STAT & 0x80U) ==0x80U)
-    { 
-    } /* Wait */
-
-    canREG1->IF2MSK  = 0xC0000000U | (uint32)((uint32)((uint32)0x000007FFU & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF2ARB  = (uint32)0x80000000U | (uint32)0x40000000U | (uint32)0x20000000U | (uint32)((uint32)((uint32)4U & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF2MCTL = 0x00001000U | (uint32)0x00000000U | (uint32)0x00000000U | (uint32)0x00000000U | (uint32)8U;
-    canREG1->IF2CMD  = (uint8) 0xF8U;
-    canREG1->IF2NO   = 4U;
-
-    /** - Initialize message 5 
-    *     - Wait until IF1 is ready for use 
-    *     - Set message mask
-    *     - Set message control word
-    *     - Set message arbitration
-    *     - Set IF1 control byte
-    *     - Set IF1 message number
-    */
-    /*SAFETYMCUSW 28 D MR:NA <APPROVED> "Potentially infinite loop found - Hardware Status check for execution sequence" */
-    while ((canREG1->IF1STAT & 0x80U) ==0x80U)
-    { 
-    } /* Wait */
-
-    canREG1->IF1MSK  = 0xC0000000U | (uint32)((uint32)((uint32)0x000007FFU & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF1ARB  = (uint32)0x80000000U | (uint32)0x40000000U | (uint32)0x00000000U | (uint32)((uint32)((uint32)5U & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF1MCTL = 0x00001000U | (uint32)0x00000400U | (uint32)0x00000000U | (uint32)0x00000000U | (uint32)8U;
-    canREG1->IF1CMD  = (uint8) 0xF8U;
-    canREG1->IF1NO   = 5U;
-
-    /** - Initialize message 6 
-    *     - Wait until IF2 is ready for use 
-    *     - Set message mask
-    *     - Set message control word
-    *     - Set message arbitration
-    *     - Set IF2 control byte
-    *     - Set IF2 message number
-    */
-    /*SAFETYMCUSW 28 D MR:NA <APPROVED> "Potentially infinite loop found - Hardware Status check for execution sequence" */
-    while ((canREG1->IF2STAT & 0x80U) ==0x80U)
-    { 
-    } /* Wait */
-
-    canREG1->IF2MSK  = 0xC0000000U | (uint32)((uint32)((uint32)0x000007FFU & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF2ARB  = (uint32)0x80000000U | (uint32)0x40000000U | (uint32)0x00000000U | (uint32)((uint32)((uint32)6U & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF2MCTL = 0x00001000U | (uint32)0x00000400U | (uint32)0x00000000U | (uint32)0x00000000U | (uint32)8U;
-    canREG1->IF2CMD  = (uint8) 0xF8U;
-    canREG1->IF2NO   = 6U;
-
-    /** - Initialize message 11 (diagnostic test TX -- simulates an
-    *     adc2can_front 0x501 TPS frame so a bus monitor can see this
-    *     node transmitting; TEMPORARY, for bench bring-up only)
-    *     - Wait until IF1 is ready for use
-    *     - Set message mask
-    *     - Set message control word
-    *     - Set message arbitration (Dir=TX)
-    *     - Set IF1 control byte
-    *     - Set IF1 message number
-    */
-    /*SAFETYMCUSW 28 D MR:NA <APPROVED> "Potentially infinite loop found - Hardware Status check for execution sequence" */
-    while ((canREG1->IF1STAT & 0x80U) ==0x80U)
-    {
-    } /* Wait */
-
-    canREG1->IF1MSK  = 0xC0000000U | (uint32)((uint32)((uint32)0x000007FFU & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF1ARB  = (uint32)0x80000000U | (uint32)0x40000000U | (uint32)0x20000000U | (uint32)((uint32)((uint32)0x501U & (uint32)0x1FFFFFFFU) << (uint32)0U);
-    canREG1->IF1MCTL = 0x00001000U | (uint32)0x00000000U | (uint32)0x00000000U | (uint32)0x00000000U | (uint32)8U;
-    canREG1->IF1CMD  = (uint8) 0xF8U;
-    canREG1->IF1NO   = 11U;
-
-    /* Message boxes 12-24: the rest of the bus this ECU listens to for
-     * telemetry (adc2can_rear, both motor driver nodes' PDOs, their
-     * heartbeats, and the on-board ECU's calibration command) -- see
-     * telemetry.h for the ID definitions and the "Mensajes CAN" spec doc
-     * (mirrored in can-logger/cansniff/messages.py) for the field layout. */
     canConfigureRxMailbox( 12U, CAN_ID_CURRENT_DATA );
     canConfigureRxMailbox( 13U, CAN_ID_REAR_DATA );
     canConfigureRxMailbox( 14U, CAN_ID_TXPDO1_BASE + 1U );

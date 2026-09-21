@@ -2,7 +2,7 @@
 """
 Decode the Main ECU's telemetry stream on /dev/ttyUSB0.
 
-Frame format (little-endian, 70 bytes) -- keep this in lockstep with
+Frame format (little-endian, 74 bytes) -- keep this in lockstep with
 vPackFrame() in app/main.c:
 
     offset  size  field
@@ -21,12 +21,12 @@ vPackFrame() in app/main.c:
     23      2     dc_current_2
     25      2     rear_brake
     27      1     calibration_type
-    28      21    driver[0] (left):  control_word(H) target_torque(h)
-                  status_word(H) warnings(H) error(H) motor_velocity(H)
-                  motor_rated_current(I) motor_temp(B) driver_temp(B)
-                  driver_dc_voltage(H) heartbeat_state(B)
-    49      21    driver[1] (right), same layout as driver[0]
-    70      --    end
+    28      23    driver[0] (left):  control_word(H) target_torque(h)
+                  status_word(H) warnings(H) error(H) motor_velocity(i)
+                  motor_rated_current(I) driver_temp(B) driver_dc_voltage(H)
+                  motor_temp(B) heartbeat_state(B)
+    51      23    driver[1] (right), same layout as driver[0]
+    74      --    end
 
 Message catalogue / CAN IDs: see can-logger/cansniff/messages.py and the
 team's "Mensajes CAN" spec doc. Every multi-byte CAN payload field is
@@ -44,8 +44,8 @@ import os
 import struct
 import termios
 
-FRAME_SIZE = 70
-_NODE_FMT = "HhHHHHIBBHB"  # 21 bytes: see driver[] layout above
+FRAME_SIZE = 74
+_NODE_FMT = "HhHHHiIBHBB"  # 23 bytes: see driver[] layout above
 STRUCT_FMT = "<BBBH" + "HH" + "HHHH" + "HHHH" + "H" + "B" + (_NODE_FMT * 2)
 assert struct.calcsize(STRUCT_FMT) == FRAME_SIZE
 
@@ -129,8 +129,8 @@ def find_sync(fd):
 
 def render_node(n, side, d, mask):
     (control_word, target_torque, status_word, warnings, error,
-     motor_velocity, motor_rated_current, motor_temp, driver_temp,
-     driver_dc_voltage, heartbeat_state) = d
+     motor_velocity, motor_rated_current, driver_temp, driver_dc_voltage,
+     motor_temp, heartbeat_state) = d
 
     any_valid = mask & (valid_rxpdo1(n) | valid_txpdo1(n) | valid_txpdo2(n)
                          | valid_txpdo3(n) | valid_heartbeat(n))

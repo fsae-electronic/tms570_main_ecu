@@ -23,13 +23,6 @@ SIZE    = $(_T)size
 
 CPU_FLAGS = -mcpu=cortex-r4 -mfpu=vfpv3-d16 -mfloat-abi=hard -mbig-endian -mbe32 -marm
 
-# Set BENCH_TEST_SIMULATE_CAN=1 to build with the synthetic CAN-data
-# generator task instead of relying on real CAN hardware being connected.
-BENCH_TEST_SIMULATE_CAN ?= 0
-ifeq ($(BENCH_TEST_SIMULATE_CAN),1)
-  EXTRA_DEFS += -DBENCH_TEST_SIMULATE_CAN
-endif
-
 CFLAGS  = $(CPU_FLAGS) -Os -Wall -Wextra -ffunction-sections -fdata-sections -g3 $(EXTRA_DEFS)
 ASFLAGS = $(CPU_FLAGS) -x assembler-with-cpp
 
