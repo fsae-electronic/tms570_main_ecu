@@ -99,16 +99,27 @@ void _c_int00(void);
 #pragma INTERRUPT(_c_int00, RESET)
 #pragma WEAK(_c_int00)
 #else
-__attribute__((weak))
+/* Under GCC the real reset entry, _c_int00, is an assembly stub in
+ * sys_core.s. It calls _coreInitRegisters_() and _coreInitStackPointer_()
+ * and then branches here. GCC has no equivalent of TI's
+ * `#pragma INTERRUPT(..., RESET)`, so a C _c_int00 opens with a
+ * `push {..., lr}` before any stack pointer exists. After a debugger or
+ * warm reset SP_svc still holds its previous valid value, so that push
+ * works. After a real power-on SP_svc is UNKNOWN, the push data-aborts, the
+ * abort handler's stack is also uninitialized, and the part hangs with
+ * nERROR asserted. */
+void _c_int00_c(void) __attribute__((noreturn));
+#define _c_int00 _c_int00_c
 #endif
 /* SourceId : STARTUP_SourceId_001 */
 /* DesignId : STARTUP_DesignId_001 */
 /* Requirements : HL_SR508 */
 void _c_int00(void)
-{    
+{
 /* USER CODE BEGIN (5) */
 /* USER CODE END */
 
+#ifdef __TI_COMPILER_VERSION__
     /* Initialize Core Registers to avoid CCM Error */
     _coreInitRegisters_();
 
@@ -117,6 +128,7 @@ void _c_int00(void)
 
     /* Initialize Stack Pointers */
     _coreInitStackPointer_();
+#endif
 
 /* USER CODE BEGIN (7) */
 /* USER CODE END */

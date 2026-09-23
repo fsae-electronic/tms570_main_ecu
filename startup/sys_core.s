@@ -40,6 +40,19 @@
     .arm
 
 /*-------------------------------------------------------------------------------*/
+@ Reset entry (GCC only). Set up the core registers and every mode's stack
+@ before any C code runs: at power-on SP is UNKNOWN, and the C startup's
+@ prologue would push to it. See the comment in sys_startup.c.
+
+    .global _c_int00
+    .type _c_int00, %function
+
+_c_int00:
+        bl    _coreInitRegisters_
+        bl    _coreInitStackPointer_
+        b     _c_int00_c
+
+/*-------------------------------------------------------------------------------*/
 @ Initialize CPU Registers
 @ SourceId : CORE_SourceId_001
 @ DesignId : CORE_DesignId_001
