@@ -11,10 +11,7 @@
 #define CANOPEN_NMT_TX_MAILBOX canMESSAGE_BOX5
 #define CANOPEN_SDO_TX_MAILBOX canMESSAGE_BOX6
 #define CANOPEN_PDO_TX_MAILBOX canMESSAGE_BOX8
-/* Box 16 is telemetry's TXPDO2 (node 1) RX mailbox (see can.c/telemetry.h)
- * -- using it here too would let canopen_prepare_sdo_response() silently
- * repoint it away from 0x281 out from under the telemetry poll loop. */
-#define CANOPEN_RX_MAILBOX canMESSAGE_BOX9
+#define CANOPEN_RX_MAILBOX canMESSAGE_BOX16
 /* Xtd stays clear (standard 11-bit COB-IDs) and the identifier goes into
  * bits 28:18 of IFxARB -- see canSTD_ID() in can.h. */
 #define CANOPEN_STANDARD_TX_ARB(id) (0x20000000U | canSTD_ID(id))

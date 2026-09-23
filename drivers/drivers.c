@@ -144,7 +144,7 @@ void run_drivers(bool drive_enabled, int16_t torque_request)
 
         if ((s_drivers[index].state == DRIVER_STATE_DRIVE) && send_torque_now)
         {
-            (void)send_torque(s_drivers[index].node_id, (int16_t)(-10)*torque_request);
+            (void)send_torque(s_drivers[index].node_id, (int16_t)(-1)*torque_request);
         }
     }
 }

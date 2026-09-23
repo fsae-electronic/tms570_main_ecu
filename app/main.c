@@ -161,8 +161,8 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
         if( canGetData( canREG1, canMESSAGE_BOX1, raw ) != 0U )
         {
             xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
-            xTelemetryData.sensors.tps1 = (uint16_t)(raw[ 1 ] | (raw[ 0 ] << 8 ) );
-            xTelemetryData.sensors.tps2 = (uint16_t)(raw[ 3 ] | (raw[ 2 ] << 8 ) );
+            xTelemetryData.sensors.tps1 = leU16(&raw[ 0 ]);
+            xTelemetryData.sensors.tps2 = leU16(&raw[ 2 ]);
             xTelemetryData.sensors_valid = true;
             xSemaphoreGive( xTelemetryMutex );
         }
