@@ -113,7 +113,7 @@ void init_drivers(void)
     s_drivers[1].state = DRIVER_STATE_STOP;
 }
 
-void run_drivers(bool drive_enabled, int16_t torque_request)
+void run_drivers(bool drive_enabled, const int16_t torque_request[2])
 {
     uint32_t index;
     static TickType_t s_last_torque_tick = 0U;
@@ -144,7 +144,7 @@ void run_drivers(bool drive_enabled, int16_t torque_request)
 
         if ((s_drivers[index].state == DRIVER_STATE_DRIVE) && send_torque_now)
         {
-            (void)send_torque(s_drivers[index].node_id, (int16_t)(-1)*torque_request);
+            (void)send_torque(s_drivers[index].node_id, (int16_t)(-1)*torque_request[index]);
         }
     }
 }

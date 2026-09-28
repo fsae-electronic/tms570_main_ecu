@@ -373,6 +373,10 @@ void canInit(void)
     canConfigureRxMailbox( 23U, CAN_ID_HEARTBEAT_BASE + 2U );
     canConfigureRxMailbox( 24U, CAN_ID_CALIBRATION );
 
+    /* Message box 27 (25-26 are the charger's TX boxes, see charger.c):
+     * implausibility errors from the adc2can boards. */
+    canConfigureRxMailbox( 27U, CAN_ID_SENSOR_ERRORS );
+
     /** - Setup IF1 for data transmission
     *     - Wait until IF1 is ready for use 
     *     - Set IF1 control byte

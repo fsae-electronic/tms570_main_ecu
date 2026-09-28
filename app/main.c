@@ -28,9 +28,11 @@
 #include "sci.h"
 #include "gio.h"
 #include "drivers.h"
+#include "charger.h"
 
 #include "telemetry.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- Configuration ------------------------------------------------- */
@@ -38,6 +40,7 @@
 #define PRIO_CAN_RX       3U
 #define PRIO_DRIVERS      2U
 #define PRIO_TELEMETRY    1U
+#define PRIO_CHARGER      1U
 
 #define STACK_CAN_RX       256U
 #define STACK_DRIVERS      256U
@@ -47,9 +50,20 @@
 #define DRIVERS_PERIOD_MS     10U
 #define TELEMETRY_PERIOD_MS  100U
 
-#define CALIBRATION_CMD_DRIVE_ENABLE_ON  7U
-#define CALIBRATION_CMD_DRIVE_ENABLE_OFF 8U
-#define CALIBRATION_CMD_TELEMETRY 0xAU
+/* CAN ID 0x600 B0 command ids, same values as the on-board ECU's
+ * calibration_cmd_id_t. 1-6 are sensor calibrations for the adc2can
+ * boards and 9/0xA (traction) isn't implemented here, so this ECU only
+ * acts on the ones below. */
+#define CALIBRATION_CMD_DRIVE_ENABLE_ON   0x7U
+#define CALIBRATION_CMD_DRIVE_ENABLE_OFF  0x8U
+#define CALIBRATION_CMD_MODE_NORMAL       0xBU
+#define CALIBRATION_CMD_MODE_RACE         0xCU
+#define CALIBRATION_CMD_TELEMETRY_ENABLE  0xDU
+#define CALIBRATION_CMD_TELEMETRY_DISABLE 0xEU
+
+/* Race-mode torque map limits */
+#define MAX_DC_CURRENT			((int32_t)50) //A
+#define KV_EMRAX				((float)20.00) //RPM/V
 
 /* ---- Little-endian CAN payload decoding helpers ---------------------- */
 
@@ -117,7 +131,15 @@ static void vPollDriverNode( uint32 node, uint32 boxTxPdo1, uint32 boxTxPdo2,
     if( canGetData( canREG1, boxTxPdo2, raw ) != 0U )
     {
         xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
-        xTelemetryData.driver[ node ].motor_velocity     = leI32( &raw[ 0 ] );
+        xTelemetryData.driver[ node ].motor_velocity     = (-1)*(leI32( &raw[ 0 ] ));
+        if( node == 0U )
+        {
+            xTelemetryData.rear.wheel_speed_rl = xTelemetryData.driver[ node ].motor_velocity / 60;
+        }
+        else
+        {
+            xTelemetryData.rear.wheel_speed_rr = xTelemetryData.driver[ node ].motor_velocity / 60;
+        }
         xTelemetryData.driver[ node ].motor_rated_current = leU32( &raw[ 4 ] );
         xTelemetryData.driver[ node ].txpdo2_valid = true;
         xSemaphoreGive( xTelemetryMutex );
@@ -203,11 +225,46 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
             xTelemetryData.calibration_type = raw[ 0 ];
             xTelemetryData.calibration_value = raw[ 1 ];
             xTelemetryData.calibration_valid = true;
-            if( raw[ 0 ] == CALIBRATION_CMD_TELEMETRY )
+            if( raw[ 0 ] == CALIBRATION_CMD_DRIVE_ENABLE_ON )
             {
-                xTelemetryEnabled = ( raw[ 1 ] != 0U );
+                xTelemetryData.drive_enabled = true;
+            }
+            else if( raw[ 0 ] == CALIBRATION_CMD_DRIVE_ENABLE_OFF )
+            {
+                xTelemetryData.drive_enabled = false;
+            }
+            else if( raw[ 0 ] == CALIBRATION_CMD_TELEMETRY_ENABLE )
+            {
+                xTelemetryEnabled = true;
+            }
+            else if( raw[ 0 ] == CALIBRATION_CMD_TELEMETRY_DISABLE )
+            {
+                xTelemetryEnabled = false;
+            }
+            else if( raw[ 0 ] == CALIBRATION_CMD_MODE_NORMAL )
+            {
+                xTelemetryData.race_mode = false;
+            }
+            else if( raw[ 0 ] == CALIBRATION_CMD_MODE_RACE )
+            {
+                xTelemetryData.race_mode = true;
             }
             xSemaphoreGive( xTelemetryMutex );
+        }
+
+        /* CAN ID 0x401: TPS / brake implausibility, detected by the
+         * adc2can boards and sent once per fault. Stop the car by forcing
+         * drive off, exactly as if cmd 8 had arrived -- it stays stopped
+         * until the on-board ECU sends a new drive-on (cmd 7). Polled after
+         * 0x600 so a fault wins over a drive-on in the same cycle. */
+        if( canGetData( canREG1, canMESSAGE_BOX27, raw ) != 0U )
+        {
+            if( ( raw[ 0 ] != 0U ) || ( raw[ 1 ] != 0U ) )
+            {
+                xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
+                xTelemetryData.drive_enabled = false;
+                xSemaphoreGive( xTelemetryMutex );
+            }
         }
 
         vPollDriverNode( 0U, canMESSAGE_BOX14, canMESSAGE_BOX16, canMESSAGE_BOX18,
@@ -377,38 +434,79 @@ static portTASK_FUNCTION( vTelemetryTask, pvParameters )
     }
 }
 
+/* Race-mode torque map for one driver node: follows the pedal until the
+ * motor goes past M * max_velocity (max_velocity = KV_EMRAX * DC link
+ * voltage), then the request falls off as 1/velocity so the DC current
+ * stays around MAX_DC_CURRENT. Same 0-100 scale as the TPS. Call with
+ * xTelemetryMutex held. */
+static int16_t s16RaceTorqueMap( float sensor_value, const DriverNode_t *driver )
+{
+	int16_t tps_value;
+	float velocity_value = (float) abs(driver->motor_velocity);
+	float max_velocity = (float) (KV_EMRAX*((float)(driver->driver_dc_voltage)/10.0f));
+
+	// Calculate the factor
+	float Mmin = (MAX_DC_CURRENT)/((float)(driver->motor_rated_current)/1000.0f);
+
+	float M = Mmin;
+
+	if(sensor_value > 10.0)
+	{
+		M  = Mmin *(1000.0f / sensor_value);
+	}
+	else
+	{
+		M = 100.0;
+	}
+
+	if(velocity_value > M * max_velocity)
+	{
+		//tps = Mmin * 1000.0 * (VEL_MAX / velocity)
+		tps_value = (uint16_t)((Mmin * 1000.0f * max_velocity) / velocity_value);
+	}
+	else
+	{
+		tps_value = (uint16_t)sensor_value;
+	}
+
+	return tps_value;
+}
+
 static portTASK_FUNCTION( vDriversTask, pvParameters )
 {
     bool bDriveEnabled = false;
-    int16_t s16Torque = 0;
+    int16_t s16Torque[ 2 ] = { 0, 0 };
     ( void ) pvParameters;
 
     for( ;; )
     {
         xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
 
-        /* CAN ID 0x600: Byte 0 is the command id. */
-        if( xTelemetryData.calibration_valid )
-        {
-            if( xTelemetryData.calibration_type == CALIBRATION_CMD_DRIVE_ENABLE_ON )
-            {
-                bDriveEnabled = true;
-            }
-            else if( xTelemetryData.calibration_type == CALIBRATION_CMD_DRIVE_ENABLE_OFF )
-            {
-                bDriveEnabled = false;
-            }
-        }
+        /* Drive on/off from 0x600 (cmd 7/8), or forced off by 0x401. */
+        bDriveEnabled = xTelemetryData.drive_enabled;
 
-        /* Torque is the average between APPS1 (tps1) and APPS2 (tps2) */
+        /* Normal mode: torque is the average between APPS1 (tps1) and
+         * APPS2 (tps2), linear with the pedal. Race mode: that same
+         * average goes through the per-motor torque map. */
         if( xTelemetryData.sensors_valid )
         {
-            uint32_t ulAvgTps = ( ( uint32_t ) xTelemetryData.sensors.tps1 + ( uint32_t ) xTelemetryData.sensors.tps2 ) / 2U;
-            s16Torque = ( int16_t ) ulAvgTps;
+            if( xTelemetryData.race_mode )
+            {
+                float fAvgTps = ( float ) ( xTelemetryData.sensors.tps1 + xTelemetryData.sensors.tps2 ) / ( 2.0f );
+                s16Torque[ 0 ] = s16RaceTorqueMap( fAvgTps, &xTelemetryData.driver[ 0 ] );
+                s16Torque[ 1 ] = s16RaceTorqueMap( fAvgTps, &xTelemetryData.driver[ 1 ] );
+            }
+            else
+            {
+                uint32_t ulAvgTps = ( ( uint32_t ) xTelemetryData.sensors.tps1 + ( uint32_t ) xTelemetryData.sensors.tps2 ) / 2U;
+                s16Torque[ 0 ] = ( int16_t ) ulAvgTps;
+                s16Torque[ 1 ] = ( int16_t ) ulAvgTps;
+            }
         }
         else
         {
-            s16Torque = 0;
+            s16Torque[ 0 ] = 0;
+            s16Torque[ 1 ] = 0;
         }
 
         xSemaphoreGive( xTelemetryMutex );
@@ -458,10 +556,13 @@ int main( void )
     sciSend( sciREG, ( uint32 ) strlen( pcBootMsg ), ( uint8 * ) pcBootMsg );
 
     memset( &xTelemetryData, 0, sizeof( xTelemetryData ) );
+    xTelemetryData.drive_enabled = false; /* until cmd 7 on 0x600 */
+    xTelemetryData.race_mode = false;     /* normal (linear) torque until cmd 0xC */
     xTelemetryMutex = xSemaphoreCreateMutexStatic( &xTelemetryMutexBuffer );
     configASSERT( xTelemetryMutex != NULL );
 
     init_drivers();
+    charger_init( PRIO_CHARGER );
 
     xTaskCreateStatic( vCanRxTask, "CanRx", STACK_CAN_RX, NULL,
                         PRIO_CAN_RX, xCanRxStack, &xCanRxTaskBuffer );

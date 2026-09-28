@@ -24,6 +24,7 @@
 #define CAN_ID_CURRENT_DATA  0x503U /* adc2can_rear: driver AC/DC currents */
 #define CAN_ID_REAR_DATA     0x504U /* adc2can_rear: rear brake pressure */
 #define CAN_ID_CALIBRATION   0x600U /* on-board ECU: calibration command */
+#define CAN_ID_SENSOR_ERRORS 0x401U /* adc2can_front/rear, sent once per fault: B0 TPS implausibility, B1 brake implausibility */
 
 /* Driver PDO IDs are base + node, node 1 = left, node 2 = right. */
 #define CAN_ID_RXPDO1_BASE   0x200U /* control word / target torque (commanded) */
@@ -56,7 +57,13 @@ typedef struct
 
 typedef struct
 {
-    uint16_t rear_brake;
+    uint16_t rear_brake;     /* 0x504 */
+    /* Rear wheel speeds, derived from each motor's TXPDO2 velocity
+     * (motor_velocity / 60), updated on every TXPDO2 -- not from 0x504,
+     * so rear_valid doesn't cover them (see driver[n].txpdo2_valid).
+     * Not sent over the telemetry frame. */
+    int32_t  wheel_speed_rl; /* driver[0], node 1 = left */
+    int32_t  wheel_speed_rr; /* driver[1], node 2 = right */
 } RearData_t;
 
 /* One motor driver node's worth of CANopen PDO data (0x201/0x181/0x281/0x381/0x701
@@ -102,6 +109,8 @@ typedef struct
     uint8_t         calibration_type;
     uint8_t         calibration_value;
     bool            calibration_valid;
+    bool            drive_enabled;   /* last drive cmd on 0x600: 7 on, 8 off (0x401 fault forces off) */
+    bool            race_mode;       /* last mode cmd on 0x600: 0xB normal, 0xC race */
     DriverNode_t    driver[ 2 ]; /* [0] = left/node1, [1] = right/node2 */
 } TelemetrySnapshot_t;
 
