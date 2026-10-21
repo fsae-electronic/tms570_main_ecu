@@ -19,7 +19,7 @@
 #define configTOTAL_HEAP_SIZE                   ( ( size_t ) 8192 )
 #define configMAX_TASK_NAME_LEN                 ( 16 )
 #define configIDLE_SHOULD_YIELD                 1
-#define configGENERATE_RUN_TIME_STATS           0
+#define configGENERATE_RUN_TIME_STATS           1
 #define configUSE_MALLOC_FAILED_HOOK            0
 
 #define configSUPPORT_STATIC_ALLOCATION         1
@@ -57,6 +57,14 @@
 #define INCLUDE_xTaskGetHandle                  1
 #define INCLUDE_xTaskGetIdleTaskHandle           1
 #define INCLUDE_xTimerPendFunctionCall           1
+
+/* Run-time stats (CPU load, loop timing): RTI free-running counter 1, the
+ * same one port.c sets up for the tick (RTICLK / 2 = 40 MHz, 25 ns/count,
+ * wraps every ~107 s -- only ever use unsigned differences). It reads 0
+ * until the scheduler starts, so there's nothing to configure here. */
+#define RUN_TIME_COUNTER_HZ                     ( configCPU_CLOCK_HZ / 2 )
+#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS()
+#define portGET_RUN_TIME_COUNTER_VALUE()        ( *( ( volatile unsigned int * ) 0xFFFFFC30U ) ) /* RTIFRC1 */
 
 /* Halt with interrupts disabled so a debugger sees exactly where an
  * assertion failed, rather than continuing into undefined behaviour. */

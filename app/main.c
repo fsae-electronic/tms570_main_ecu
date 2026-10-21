@@ -3,12 +3,9 @@
  *
  * Pipeline: CAN RX task polls every mailbox this ECU cares about (see
  * telemetry.h / the "Mensajes CAN" spec / can-logger/cansniff/messages.py
- * for the catalogue) and updates a mutex-protected snapshot; the telemetry
- * task wakes periodically, takes a consistent copy of that snapshot, and
- * sends it out over SCI/UART as a fixed-size frame (see vPackFrame for the
- * exact layout -- keep tools/decode_telemetry.py in sync with it). There
- * is a placeholder for SAE compliance rules between those two steps (not
- * implemented yet, by design -- see the comment at vTelemetryTask).
+ * for the catalogue) and updates the mutex-protected snapshot
+ * (xTelemetryData); the drivers task turns it into torque requests, and
+ * the telemetry task (telemetry.c) sends it out over SCI/UART.
  *
  * CAN is polled, not interrupt-driven: canGetData() itself checks the
  * hardware NEWDAT flag and returns 0 if there's nothing new, so a short
@@ -31,9 +28,10 @@
 #include "charger.h"
 
 #include "telemetry.h"
+#include "traction.h"
 
+#include <math.h>
 #include <stdlib.h>
-#include <string.h>
 
 /* ---- Configuration ------------------------------------------------- */
 
@@ -44,26 +42,65 @@
 
 #define STACK_CAN_RX       256U
 #define STACK_DRIVERS      256U
-#define STACK_TELEMETRY    256U
 
 #define CAN_RX_PERIOD_MS      10U
 #define DRIVERS_PERIOD_MS     10U
-#define TELEMETRY_PERIOD_MS  100U
 
 /* CAN ID 0x600 B0 command ids, same values as the on-board ECU's
  * calibration_cmd_id_t. 1-6 are sensor calibrations for the adc2can
- * boards and 9/0xA (traction) isn't implemented here, so this ECU only
- * acts on the ones below. */
+ * boards, so this ECU only acts on the ones below. */
 #define CALIBRATION_CMD_DRIVE_ENABLE_ON   0x7U
 #define CALIBRATION_CMD_DRIVE_ENABLE_OFF  0x8U
+#define CALIBRATION_CMD_TRACTION_ON       0x9U
+#define CALIBRATION_CMD_TRACTION_OFF      0xAU
 #define CALIBRATION_CMD_MODE_NORMAL       0xBU
 #define CALIBRATION_CMD_MODE_RACE         0xCU
 #define CALIBRATION_CMD_TELEMETRY_ENABLE  0xDU
 #define CALIBRATION_CMD_TELEMETRY_DISABLE 0xEU
 
+/* TPS arrives on 0x501 as 0-100 % (adc2can_front), but the drives take
+ * target torque in 0-1000 per mille of rated torque (1000 = motor rated
+ * current), and the race map is written for that 0-1000 scale too.
+ * TESTING: left at 1 so the pedal only spans 0-100 (1/10 of the range);
+ * set to 10 for full torque. */
+#define TPS_TO_TORQUE           10U
+
+/* EV.4.7 APPS / Brake Pedal Plausibility Check: brake engaged (front or
+ * rear pressure above BRAKE_ENGAGED_PSI) while either APPS reads more than
+ * APPS_BRAKE_TRIP_PCT stops the motors; they stay stopped until both APPS
+ * read less than APPS_BRAKE_RESET_PCT, with or without brake. TPS is the
+ * raw 0-100 % pedal travel from 0x501. */
+#define BRAKE_ENGAGED_PSI       50U  /* same as the on-board ECU's DRIVE_ENABLE_MIN_BRAKE_PSI */
+#define APPS_BRAKE_TRIP_PCT     25U
+#define APPS_BRAKE_RESET_PCT    5U
+
+/* T.4.2.11 / T.4.3.5: APPS and BSE arrive over CAN, so losing their frames
+ * is a sensor failure. If 0x501 (TPS), 0x502 (front brake) or 0x504 (rear
+ * brake) hasn't arrived for more than SENSOR_CAN_TIMEOUT_MS -- or never
+ * arrived -- drive is forced off like an implausibility; it takes a new
+ * drive-on (cmd 7) once the frames are back. The adc2can boards send
+ * every 10 ms. */
+#define SENSOR_CAN_TIMEOUT_MS   100U /* SENSOR_TIMEOUT_* bits: telemetry.h */
+
+/* 0x403 to the on-board ECU: B0 EV.4.7 active, B1 SENSOR_TIMEOUT_* bits.
+ * Sent whenever either changes, and repeated every
+ * MAIN_ECU_ERRORS_PERIOD_MS while any is active so a dashboard that missed
+ * the edge (or booted late) still shows it. */
+#define MAIN_ECU_ERRORS_MAILBOX     canMESSAGE_BOX28
+#define MAIN_ECU_ERRORS_PERIOD_MS   100U
+
+/* Motor turns per rear wheel turn: rear wheel speed = motor_velocity /
+ * GEAR_RATIO, in wheel RPM like the fronts (needed for the slip ratio). */
+#define GEAR_RATIO              4
+
+/* Low-pass on each TXPDO2 velocity sample (every 10 ms): alpha 0.25 is a
+ * ~30 ms time constant. The raw value is noisy enough to make the race map
+ * request and the TC slip jump around from one cycle to the next. */
+#define VELOCITY_FILTER_ALPHA   0.35f
+
 /* Race-mode torque map limits */
-#define MAX_DC_CURRENT			((int32_t)50) //A
-#define KV_EMRAX				((float)20.00) //RPM/V
+#define MAX_DC_CURRENT			((int32_t)75) //A, battery DC limit per driver
+#define KV_EMRAX				((float)22.00) //RPM/V
 
 /* ---- Little-endian CAN payload decoding helpers ---------------------- */
 
@@ -90,22 +127,13 @@ static int32_t leI32( const uint8 *p )
     return ( int32_t ) leU32( p );
 }
 
-/* ---- Shared state ---------------------------------------------------*/
-
-TelemetrySnapshot_t xTelemetryData;
-SemaphoreHandle_t xTelemetryMutex;
-static bool xTelemetryEnabled = true;
-
-static StaticSemaphore_t xTelemetryMutexBuffer;
+/* ---- Task storage ---------------------------------------------------*/
 
 static StaticTask_t xCanRxTaskBuffer;
 static StackType_t xCanRxStack[ STACK_CAN_RX ];
 
 static StaticTask_t xDriversTaskBuffer;
 static StackType_t xDriversStack[ STACK_DRIVERS ];
-
-static StaticTask_t xTelemetryTaskBuffer;
-static StackType_t xTelemetryStack[ STACK_TELEMETRY ];
 
 /* ---- Tasks ------------------------------------------------------------*/
 
@@ -125,33 +153,51 @@ static void vPollDriverNode( uint32 node, uint32 boxTxPdo1, uint32 boxTxPdo2,
         xTelemetryData.driver[ node ].warnings    = leU16( &raw[ 2 ] );
         xTelemetryData.driver[ node ].error       = leU16( &raw[ 4 ] );
         xTelemetryData.driver[ node ].txpdo1_valid = true;
+        xTelemetryData.driver[ node ].txpdo1_rx_tick = xTaskGetTickCount();
         xSemaphoreGive( xTelemetryMutex );
     }
 
+    /* TXPDO2 (10 ms): B0-3 0x606C velocity actual value (int32),
+     * B4-5 0x6079 DC link circuit voltage (uint16). */
     if( canGetData( canREG1, boxTxPdo2, raw ) != 0U )
     {
         xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
         xTelemetryData.driver[ node ].motor_velocity     = (-1)*(leI32( &raw[ 0 ] ));
-        if( node == 0U )
+        if( !xTelemetryData.driver[ node ].txpdo2_valid )
         {
-            xTelemetryData.rear.wheel_speed_rl = xTelemetryData.driver[ node ].motor_velocity / 60;
+            /* First sample: seed the filter instead of ramping up from 0. */
+            xTelemetryData.driver[ node ].motor_velocity_f = ( float ) xTelemetryData.driver[ node ].motor_velocity;
         }
         else
         {
-            xTelemetryData.rear.wheel_speed_rr = xTelemetryData.driver[ node ].motor_velocity / 60;
+            xTelemetryData.driver[ node ].motor_velocity_f +=
+                VELOCITY_FILTER_ALPHA * ( ( float ) xTelemetryData.driver[ node ].motor_velocity -
+                                          xTelemetryData.driver[ node ].motor_velocity_f );
         }
-        xTelemetryData.driver[ node ].motor_rated_current = leU32( &raw[ 4 ] );
+        if( node == 0U )
+        {
+            xTelemetryData.rear.wheel_speed_rl = ( int32_t ) ( xTelemetryData.driver[ node ].motor_velocity_f / GEAR_RATIO );
+        }
+        else
+        {
+            xTelemetryData.rear.wheel_speed_rr = ( int32_t ) ( xTelemetryData.driver[ node ].motor_velocity_f / GEAR_RATIO );
+        }
+        xTelemetryData.driver[ node ].driver_dc_voltage = leU16( &raw[ 4 ] );
         xTelemetryData.driver[ node ].txpdo2_valid = true;
+        xTelemetryData.driver[ node ].txpdo2_rx_tick = xTaskGetTickCount();
         xSemaphoreGive( xTelemetryMutex );
     }
 
+    /* TXPDO3 (100 ms): B0-3 0x6075 motor rated current (uint32, mA),
+     * B4 0x2026 controller temperature, B5 0x2025 motor temperature. */
     if( canGetData( canREG1, boxTxPdo3, raw ) != 0U )
     {
         xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
-        xTelemetryData.driver[ node ].driver_temp       = raw[ 0 ];
-        xTelemetryData.driver[ node ].driver_dc_voltage = leU16( &raw[ 1 ] );
-        xTelemetryData.driver[ node ].motor_temp         = raw[ 3 ];
+        xTelemetryData.driver[ node ].motor_rated_current = leU32( &raw[ 0 ] );
+        xTelemetryData.driver[ node ].driver_temp         = raw[ 4 ];
+        xTelemetryData.driver[ node ].motor_temp          = raw[ 5 ];
         xTelemetryData.driver[ node ].txpdo3_valid = true;
+        xTelemetryData.driver[ node ].txpdo3_rx_tick = xTaskGetTickCount();
         xSemaphoreGive( xTelemetryMutex );
     }
 
@@ -161,6 +207,7 @@ static void vPollDriverNode( uint32 node, uint32 boxTxPdo1, uint32 boxTxPdo2,
         xTelemetryData.driver[ node ].control_word  = leU16( &raw[ 0 ] );
         xTelemetryData.driver[ node ].target_torque = leI16( &raw[ 2 ] );
         xTelemetryData.driver[ node ].rxpdo1_valid = true;
+        xTelemetryData.driver[ node ].rxpdo1_rx_tick = xTaskGetTickCount();
         xSemaphoreGive( xTelemetryMutex );
     }
 
@@ -169,6 +216,7 @@ static void vPollDriverNode( uint32 node, uint32 boxTxPdo1, uint32 boxTxPdo2,
         xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
         xTelemetryData.driver[ node ].heartbeat_state = raw[ 0 ];
         xTelemetryData.driver[ node ].heartbeat_valid = true;
+        xTelemetryData.driver[ node ].heartbeat_rx_tick = xTaskGetTickCount();
         xSemaphoreGive( xTelemetryMutex );
     }
 }
@@ -186,6 +234,7 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
             xTelemetryData.sensors.tps1 = leU16(&raw[ 0 ]);
             xTelemetryData.sensors.tps2 = leU16(&raw[ 2 ]);
             xTelemetryData.sensors_valid = true;
+            xTelemetryData.sensors_rx_tick = xTaskGetTickCount();
             xSemaphoreGive( xTelemetryMutex );
         }
 
@@ -197,6 +246,7 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
             xTelemetryData.front_axle.steering_angle = leU16( &raw[ 4 ] );
             xTelemetryData.front_axle.front_brake    = leU16( &raw[ 6 ] );
             xTelemetryData.front_axle_valid = true;
+            xTelemetryData.front_axle_rx_tick = xTaskGetTickCount();
             xSemaphoreGive( xTelemetryMutex );
         }
 
@@ -208,6 +258,7 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
             xTelemetryData.current.dc_current_1 = leU16( &raw[ 4 ] );
             xTelemetryData.current.dc_current_2 = leU16( &raw[ 6 ] );
             xTelemetryData.current_valid = true;
+            xTelemetryData.current_rx_tick = xTaskGetTickCount();
             xSemaphoreGive( xTelemetryMutex );
         }
 
@@ -216,6 +267,7 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
             xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
             xTelemetryData.rear.rear_brake = leU16( &raw[ 0 ] );
             xTelemetryData.rear_valid = true;
+            xTelemetryData.rear_rx_tick = xTaskGetTickCount();
             xSemaphoreGive( xTelemetryMutex );
         }
 
@@ -225,21 +277,31 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
             xTelemetryData.calibration_type = raw[ 0 ];
             xTelemetryData.calibration_value = raw[ 1 ];
             xTelemetryData.calibration_valid = true;
+            xTelemetryData.calibration_rx_tick = xTaskGetTickCount();
             if( raw[ 0 ] == CALIBRATION_CMD_DRIVE_ENABLE_ON )
             {
                 xTelemetryData.drive_enabled = true;
+                xTelemetryData.sensor_fault = false;
             }
             else if( raw[ 0 ] == CALIBRATION_CMD_DRIVE_ENABLE_OFF )
             {
                 xTelemetryData.drive_enabled = false;
             }
+            else if( raw[ 0 ] == CALIBRATION_CMD_TRACTION_ON )
+            {
+                xTelemetryData.traction_on = true;
+            }
+            else if( raw[ 0 ] == CALIBRATION_CMD_TRACTION_OFF )
+            {
+                xTelemetryData.traction_on = false;
+            }
             else if( raw[ 0 ] == CALIBRATION_CMD_TELEMETRY_ENABLE )
             {
-                xTelemetryEnabled = true;
+                telemetry_set_enabled( true );
             }
             else if( raw[ 0 ] == CALIBRATION_CMD_TELEMETRY_DISABLE )
             {
-                xTelemetryEnabled = false;
+                telemetry_set_enabled( false );
             }
             else if( raw[ 0 ] == CALIBRATION_CMD_MODE_NORMAL )
             {
@@ -263,6 +325,7 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
             {
                 xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
                 xTelemetryData.drive_enabled = false;
+                xTelemetryData.sensor_fault = true;
                 xSemaphoreGive( xTelemetryMutex );
             }
         }
@@ -276,173 +339,41 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
     }
 }
 
-/* ---- Wire frame -------------------------------------------------------
- *
- * Every multi-byte field is little-endian, matching the CAN payloads
- * themselves (see telemetry.h). Layout (keep tools/decode_telemetry.py's
- * struct format string in lockstep with this):
- *
- *   offset  size  field
- *   0       2     sync (0xAA 0x55)
- *   2       1     version (2)
- *   3       2     valid_mask (bit set per message actually received at
- *                 least once -- see TELEMETRY_VALID_* below)
- *   5       2     tps1
- *   7       2     tps2
- *   9       2     wheel_speed_fl
- *   11      2     wheel_speed_fr
- *   13      2     steering_angle
- *   15      2     front_brake
- *   17      2     ac_current_1
- *   19      2     ac_current_2
- *   21      2     dc_current_1
- *   23      2     dc_current_2
- *   25      2     rear_brake
- *   27      1     calibration_type
- *   28      ...   per driver node (left then right), 23 bytes each:
- *                   control_word(2) target_torque(2) status_word(2)
- *                   warnings(2) error(2) motor_velocity(4)
- *                   motor_rated_current(4) driver_temp(1)
- *                   driver_dc_voltage(2) motor_temp(1) heartbeat_state(1)
- *   74      --    end
- */
-#define TELEMETRY_FRAME_SIZE 74U
-
-#define TELEMETRY_VALID_TPS        ( 1U << 0 )
-#define TELEMETRY_VALID_FRONT      ( 1U << 1 )
-#define TELEMETRY_VALID_CURRENT    ( 1U << 2 )
-#define TELEMETRY_VALID_REAR       ( 1U << 3 )
-#define TELEMETRY_VALID_CAL        ( 1U << 4 )
-#define TELEMETRY_VALID_RXPDO1( n )    ( 1U << ( 5U + ( 5U * ( n ) ) ) )
-#define TELEMETRY_VALID_TXPDO1( n )    ( 1U << ( 6U + ( 5U * ( n ) ) ) )
-#define TELEMETRY_VALID_TXPDO2( n )    ( 1U << ( 7U + ( 5U * ( n ) ) ) )
-#define TELEMETRY_VALID_TXPDO3( n )    ( 1U << ( 8U + ( 5U * ( n ) ) ) )
-#define TELEMETRY_VALID_HEARTBEAT( n ) ( 1U << ( 9U + ( 5U * ( n ) ) ) )
-
-static void putU8( uint8_t *pxFrame, uint32_t *pIdx, uint8_t v )
+/* Normal-mode torque for one driver node: linear with the pedal, scaled so
+ * full pedal asks for the torque whose phase current equals the battery DC
+ * limit (at top speed I_phase_rms ~ I_dc):
+ *     torque_max = 1000 * MAX_DC_CURRENT / motor_rated_current
+ * e.g. 75 A DC with 200 A rated -> 375. motor_rated_current is the phase
+ * current at torque 1000, in mA (TXPDO3); until it arrives there is no
+ * current reference, so the request stays at 0. sensor_value and the result
+ * are 0-1000. Call with xTelemetryMutex held. */
+static int16_t s16NormalTorque( uint32_t sensor_value, const DriverNode_t *driver )
 {
-    pxFrame[ *pIdx ] = v;
-    *pIdx += 1U;
-}
+    uint32_t ulTorqueMax;
 
-static void putU16( uint8_t *pxFrame, uint32_t *pIdx, uint16_t v )
-{
-    pxFrame[ *pIdx ]     = ( uint8_t ) ( v & 0xFFU );
-    pxFrame[ *pIdx + 1 ] = ( uint8_t ) ( v >> 8 );
-    *pIdx += 2U;
-}
-
-static void putU32( uint8_t *pxFrame, uint32_t *pIdx, uint32_t v )
-{
-    pxFrame[ *pIdx ]     = ( uint8_t ) ( v & 0xFFU );
-    pxFrame[ *pIdx + 1 ] = ( uint8_t ) ( ( v >> 8 ) & 0xFFU );
-    pxFrame[ *pIdx + 2 ] = ( uint8_t ) ( ( v >> 16 ) & 0xFFU );
-    pxFrame[ *pIdx + 3 ] = ( uint8_t ) ( v >> 24 );
-    *pIdx += 4U;
-}
-
-static void vPackFrame( const TelemetrySnapshot_t *pxSnapshot, uint8_t *pxFrame )
-{
-    uint32_t ulMask = 0U;
-    uint32_t n;
-    uint32_t idx = 0U;
-
-    if( pxSnapshot->sensors_valid )     { ulMask |= TELEMETRY_VALID_TPS; }
-    if( pxSnapshot->front_axle_valid )  { ulMask |= TELEMETRY_VALID_FRONT; }
-    if( pxSnapshot->current_valid )     { ulMask |= TELEMETRY_VALID_CURRENT; }
-    if( pxSnapshot->rear_valid )        { ulMask |= TELEMETRY_VALID_REAR; }
-    if( pxSnapshot->calibration_valid ) { ulMask |= TELEMETRY_VALID_CAL; }
-    for( n = 0U; n < 2U; n++ )
+    if( driver->motor_rated_current == 0U )
     {
-        if( pxSnapshot->driver[ n ].rxpdo1_valid )    { ulMask |= TELEMETRY_VALID_RXPDO1( n ); }
-        if( pxSnapshot->driver[ n ].txpdo1_valid )    { ulMask |= TELEMETRY_VALID_TXPDO1( n ); }
-        if( pxSnapshot->driver[ n ].txpdo2_valid )    { ulMask |= TELEMETRY_VALID_TXPDO2( n ); }
-        if( pxSnapshot->driver[ n ].txpdo3_valid )    { ulMask |= TELEMETRY_VALID_TXPDO3( n ); }
-        if( pxSnapshot->driver[ n ].heartbeat_valid ) { ulMask |= TELEMETRY_VALID_HEARTBEAT( n ); }
+        return 0;
     }
 
-    putU8( pxFrame, &idx, 0xAAU );
-    putU8( pxFrame, &idx, 0x55U );
-    putU8( pxFrame, &idx, 2U ); /* version */
-    putU16( pxFrame, &idx, ( uint16_t ) ulMask );
-
-    putU16( pxFrame, &idx, pxSnapshot->sensors.tps1 );
-    putU16( pxFrame, &idx, pxSnapshot->sensors.tps2 );
-
-    putU16( pxFrame, &idx, pxSnapshot->front_axle.wheel_speed_fl );
-    putU16( pxFrame, &idx, pxSnapshot->front_axle.wheel_speed_fr );
-    putU16( pxFrame, &idx, pxSnapshot->front_axle.steering_angle );
-    putU16( pxFrame, &idx, pxSnapshot->front_axle.front_brake );
-
-    putU16( pxFrame, &idx, pxSnapshot->current.ac_current_1 );
-    putU16( pxFrame, &idx, pxSnapshot->current.ac_current_2 );
-    putU16( pxFrame, &idx, pxSnapshot->current.dc_current_1 );
-    putU16( pxFrame, &idx, pxSnapshot->current.dc_current_2 );
-
-    putU16( pxFrame, &idx, pxSnapshot->rear.rear_brake );
-
-    putU8( pxFrame, &idx, pxSnapshot->calibration_type );
-
-    for( n = 0U; n < 2U; n++ )
+    ulTorqueMax = ( 1000U * ( uint32_t ) MAX_DC_CURRENT * 1000U ) / driver->motor_rated_current;
+    if( ulTorqueMax > 1000U )
     {
-        const DriverNode_t *pxNode = &pxSnapshot->driver[ n ];
-
-        putU16( pxFrame, &idx, pxNode->control_word );
-        putU16( pxFrame, &idx, ( uint16_t ) pxNode->target_torque );
-        putU16( pxFrame, &idx, pxNode->status_word );
-        putU16( pxFrame, &idx, pxNode->warnings );
-        putU16( pxFrame, &idx, pxNode->error );
-        putU32( pxFrame, &idx, ( uint32_t ) pxNode->motor_velocity );
-        putU32( pxFrame, &idx, pxNode->motor_rated_current );
-        putU8( pxFrame, &idx, pxNode->driver_temp );
-        putU16( pxFrame, &idx, pxNode->driver_dc_voltage );
-        putU8( pxFrame, &idx, pxNode->motor_temp );
-        putU8( pxFrame, &idx, pxNode->heartbeat_state );
+        ulTorqueMax = 1000U;
     }
-}
 
-static portTASK_FUNCTION( vTelemetryTask, pvParameters )
-{
-    TelemetrySnapshot_t xSnapshot;
-    uint8_t xFrame[ TELEMETRY_FRAME_SIZE ];
-    bool bTelemetryEnabled;
-    ( void ) pvParameters;
-
-    for( ;; )
-    {
-        vTaskDelay( pdMS_TO_TICKS( TELEMETRY_PERIOD_MS ) );
-
-        xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
-        xSnapshot = xTelemetryData;
-        xSemaphoreGive( xTelemetryMutex );
-
-        xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
-        bTelemetryEnabled = xTelemetryEnabled;
-        xSemaphoreGive( xTelemetryMutex );
-
-        if( !bTelemetryEnabled )
-        {
-            continue;
-        }
-
-        /* TODO: SAE compliance rules go here, between reading the
-         * snapshot and sending it -- deliberately not implemented yet.
-         * For now this is a straight pass-through. */
-
-        vPackFrame( &xSnapshot, xFrame );
-        sciSend( sciREG, TELEMETRY_FRAME_SIZE, xFrame );
-    }
+    return ( int16_t ) ( ( sensor_value * ulTorqueMax ) / 1000U );
 }
 
 /* Race-mode torque map for one driver node: follows the pedal until the
  * motor goes past M * max_velocity (max_velocity = KV_EMRAX * DC link
  * voltage), then the request falls off as 1/velocity so the DC current
- * stays around MAX_DC_CURRENT. Same 0-100 scale as the TPS. Call with
- * xTelemetryMutex held. */
+ * stays around MAX_DC_CURRENT. sensor_value and the result are 0-1000
+ * (per mille of rated torque). Call with xTelemetryMutex held. */
 static int16_t s16RaceTorqueMap( float sensor_value, const DriverNode_t *driver )
 {
 	int16_t tps_value;
-	float velocity_value = (float) abs(driver->motor_velocity);
+	float velocity_value = fabsf(driver->motor_velocity_f);
 	float max_velocity = (float) (KV_EMRAX*((float)(driver->driver_dc_voltage)/10.0f));
 
 	// Calculate the factor
@@ -472,35 +403,152 @@ static int16_t s16RaceTorqueMap( float sensor_value, const DriverNode_t *driver 
 	return tps_value;
 }
 
+/* EV.4.7: latches on brake + pedal > 25 %, releases on pedal < 5 % alone
+ * (no manual action needed). Uses the higher of the two APPS so a single
+ * sensor reading high is enough to trip and keep it tripped. Call with
+ * xTelemetryMutex held. */
+static bool bBrakeEngaged( const TelemetrySnapshot_t *pxData )
+{
+    return ( pxData->front_axle_valid && ( pxData->front_axle.front_brake > BRAKE_ENGAGED_PSI ) ) ||
+           ( pxData->rear_valid && ( pxData->rear.rear_brake > BRAKE_ENGAGED_PSI ) );
+}
+
+static bool bAppsBrakePlausibility( const TelemetrySnapshot_t *pxData, bool bFault )
+{
+    uint16_t usPedal = ( pxData->sensors.tps1 > pxData->sensors.tps2 ) ? pxData->sensors.tps1
+                                                                         : pxData->sensors.tps2;
+    bool bBrake = bBrakeEngaged( pxData );
+
+    if( !pxData->sensors_valid )
+    {
+        return bFault;
+    }
+
+    if( bBrake && ( usPedal > APPS_BRAKE_TRIP_PCT ) )
+    {
+        return true;
+    }
+
+    if( usPedal < APPS_BRAKE_RESET_PCT )
+    {
+        return false;
+    }
+
+    return bFault;
+}
+
+static bool bFrameTimedOut( bool bValid, TickType_t xRxTick, TickType_t xNow )
+{
+    return !bValid || ( ( xNow - xRxTick ) > pdMS_TO_TICKS( SENSOR_CAN_TIMEOUT_MS ) );
+}
+
+/* SENSOR_TIMEOUT_* bits for the sensor frames that are missing right now.
+ * Call with xTelemetryMutex held. */
+static uint8_t u8CheckSensorTimeouts( const TelemetrySnapshot_t *pxData, TickType_t xNow )
+{
+    uint8_t u8Timeouts = 0U;
+
+    if( bFrameTimedOut( pxData->sensors_valid, pxData->sensors_rx_tick, xNow ) )
+    {
+        u8Timeouts |= SENSOR_TIMEOUT_TPS;
+    }
+    if( bFrameTimedOut( pxData->front_axle_valid, pxData->front_axle_rx_tick, xNow ) )
+    {
+        u8Timeouts |= SENSOR_TIMEOUT_FRONT;
+    }
+    if( bFrameTimedOut( pxData->rear_valid, pxData->rear_rx_tick, xNow ) )
+    {
+        u8Timeouts |= SENSOR_TIMEOUT_REAR;
+    }
+
+    return u8Timeouts;
+}
+
+static void vSendMainEcuErrors( bool bAppsBrakeFault, uint8_t u8SensorTimeouts )
+{
+    uint8 data[ 8 ] = { 0U };
+
+    data[ 0 ] = bAppsBrakeFault ? 1U : 0U;
+    data[ 1 ] = u8SensorTimeouts;
+    ( void ) canTransmit( canREG1, MAIN_ECU_ERRORS_MAILBOX, data );
+}
+
+/* Loop timing for the telemetry slow frame: wall time of one drivers loop
+ * iteration (work only, without the vTaskDelay; preemption by CAN RX
+ * counts). Longer than DRIVERS_PERIOD_MS is an overrun -- expect one each
+ * time drive is enabled, since run_drivers() blocks ~15 ms in the
+ * CiA 402 enable sequence. */
+static void vRecordLoopTime( uint32_t ulCounts )
+{
+    uint32_t ulUs = ulCounts / ( RUN_TIME_COUNTER_HZ / 1000000U );
+
+    xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
+    if( ulUs > xTelemetryData.loop_time_max_us )
+    {
+        xTelemetryData.loop_time_max_us = ( ulUs > 0xFFFFU ) ? 0xFFFFU : ( uint16_t ) ulUs;
+    }
+    if( ( ulUs > ( DRIVERS_PERIOD_MS * 1000U ) ) && ( xTelemetryData.loop_overruns < 0xFFFFU ) )
+    {
+        xTelemetryData.loop_overruns++;
+    }
+    xSemaphoreGive( xTelemetryMutex );
+}
+
 static portTASK_FUNCTION( vDriversTask, pvParameters )
 {
     bool bDriveEnabled = false;
+    bool bAppsBrakeFault = false;
+    bool bAppsBrakeFaultSent = false;
+    uint8_t u8SensorTimeouts = 0U;
+    uint8_t u8SensorTimeoutsSent = 0U;
+    TickType_t xLastErrorsTx = 0U;
     int16_t s16Torque[ 2 ] = { 0, 0 };
+    uint16_t usControlWord;
+    int16_t s16TargetTorque;
+    TickType_t xTxTick;
+    uint32_t n;
+    uint32_t ulLoopStart;
     ( void ) pvParameters;
 
     for( ;; )
     {
+        ulLoopStart = portGET_RUN_TIME_COUNTER_VALUE();
+
         xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
 
-        /* Drive on/off from 0x600 (cmd 7/8), or forced off by 0x401. */
+        /* Sensor frames missing -> treated like an implausibility: drive
+         * forced off, needs a new cmd 7 once they're back. */
+        u8SensorTimeouts = u8CheckSensorTimeouts( &xTelemetryData, xTaskGetTickCount() );
+        xTelemetryData.sensor_timeouts = u8SensorTimeouts;
+        if( u8SensorTimeouts != 0U )
+        {
+            xTelemetryData.drive_enabled = false;
+        }
+
+        /* Drive on/off from 0x600 (cmd 7/8), or forced off by 0x401 or a
+         * sensor CAN timeout. */
         bDriveEnabled = xTelemetryData.drive_enabled;
 
-        /* Normal mode: torque is the average between APPS1 (tps1) and
-         * APPS2 (tps2), linear with the pedal. Race mode: that same
-         * average goes through the per-motor torque map. */
+        /* The average between APPS1 (tps1) and APPS2 (tps2), scaled to
+         * 0-1000, goes through the per-motor torque map of the current
+         * mode: normal (linear, capped at the DC current limit) or race. */
+        xTelemetryData.race_map_limiting = false;
         if( xTelemetryData.sensors_valid )
         {
             if( xTelemetryData.race_mode )
             {
-                float fAvgTps = ( float ) ( xTelemetryData.sensors.tps1 + xTelemetryData.sensors.tps2 ) / ( 2.0f );
+                float fAvgTps = ( float ) ( ( xTelemetryData.sensors.tps1 + xTelemetryData.sensors.tps2 ) * TPS_TO_TORQUE ) / ( 2.0f );
                 s16Torque[ 0 ] = s16RaceTorqueMap( fAvgTps, &xTelemetryData.driver[ 0 ] );
                 s16Torque[ 1 ] = s16RaceTorqueMap( fAvgTps, &xTelemetryData.driver[ 1 ] );
+                /* Below the pedal -> the 1/velocity (DC current) fall-off kicked in. */
+                xTelemetryData.race_map_limiting = ( ( float ) s16Torque[ 0 ] < fAvgTps ) ||
+                                                   ( ( float ) s16Torque[ 1 ] < fAvgTps );
             }
             else
             {
-                uint32_t ulAvgTps = ( ( uint32_t ) xTelemetryData.sensors.tps1 + ( uint32_t ) xTelemetryData.sensors.tps2 ) / 2U;
-                s16Torque[ 0 ] = ( int16_t ) ulAvgTps;
-                s16Torque[ 1 ] = ( int16_t ) ulAvgTps;
+                uint32_t ulAvgTps = ( ( ( uint32_t ) xTelemetryData.sensors.tps1 + ( uint32_t ) xTelemetryData.sensors.tps2 ) * TPS_TO_TORQUE ) / 2U;
+                s16Torque[ 0 ] = s16NormalTorque( ulAvgTps, &xTelemetryData.driver[ 0 ] );
+                s16Torque[ 1 ] = s16NormalTorque( ulAvgTps, &xTelemetryData.driver[ 1 ] );
             }
         }
         else
@@ -509,9 +557,80 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
             s16Torque[ 1 ] = 0;
         }
 
+        xTelemetryData.torque_request[ 0 ] = s16Torque[ 0 ];
+        xTelemetryData.torque_request[ 1 ] = s16Torque[ 1 ];
+
+        /* Traction control (cmd 9 on / 0xA off): cuts each motor's
+         * request while its rear wheel slips past the target. */
+        if( xTelemetryData.traction_on && bDriveEnabled )
+        {
+            traction_apply( &xTelemetryData, s16Torque, ( float ) DRIVERS_PERIOD_MS / 1000.0f );
+        }
+        else
+        {
+            traction_reset();
+        }
+
+        xTelemetryData.torque_cmd[ 0 ] = s16Torque[ 0 ];
+        xTelemetryData.torque_cmd[ 1 ] = s16Torque[ 1 ];
+        xTelemetryData.tc_cutting[ 0 ] = ( s16Torque[ 0 ] < xTelemetryData.torque_request[ 0 ] );
+        xTelemetryData.tc_cutting[ 1 ] = ( s16Torque[ 1 ] < xTelemetryData.torque_request[ 1 ] );
+
+        /* EV.4.7: brake + pedal > 25 % forces drive off, exactly like a
+         * 0x401 fault or cmd 8: the drives stop and stay stopped until the
+         * normal start (brake + button -> cmd 7). They used to restart on
+         * their own once the pedal was back under 5 %, which re-enabled the
+         * inverters with the car still rolling and tripped both with
+         * gate-driver faults (0xFF06 / 0xFF0A). cmd 7 is only accepted
+         * once the pedal is under 5 % (the fault stays latched until then). */
+        xTelemetryData.brake_engaged = bBrakeEngaged( &xTelemetryData );
+        bAppsBrakeFault = bAppsBrakePlausibility( &xTelemetryData, bAppsBrakeFault );
+        xTelemetryData.apps_brake_fault = bAppsBrakeFault;
+        if( bAppsBrakeFault )
+        {
+            xTelemetryData.drive_enabled = false;
+            bDriveEnabled = false;
+            s16Torque[ 0 ] = 0;
+            s16Torque[ 1 ] = 0;
+            traction_reset();
+            xTelemetryData.torque_cmd[ 0 ] = 0;
+            xTelemetryData.torque_cmd[ 1 ] = 0;
+            xTelemetryData.tc_cutting[ 0 ] = false;
+            xTelemetryData.tc_cutting[ 1 ] = false;
+        }
+
         xSemaphoreGive( xTelemetryMutex );
 
         run_drivers( bDriveEnabled, s16Torque );
+
+        /* What actually went out on RXPDO1, for telemetry. */
+        for( n = 0U; n < 2U; n++ )
+        {
+            if( drivers_last_rxpdo1( n, &usControlWord, &s16TargetTorque, &xTxTick ) )
+            {
+                xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
+                xTelemetryData.driver[ n ].control_word = usControlWord;
+                xTelemetryData.driver[ n ].target_torque = s16TargetTorque;
+                xTelemetryData.driver[ n ].rxpdo1_valid = true;
+                xTelemetryData.driver[ n ].rxpdo1_rx_tick = xTxTick;
+                xSemaphoreGive( xTelemetryMutex );
+            }
+        }
+
+        /* Tell the on-board ECU so the driver sees it: on every change,
+         * then periodically while active. */
+        if( ( bAppsBrakeFault != bAppsBrakeFaultSent ) ||
+            ( u8SensorTimeouts != u8SensorTimeoutsSent ) ||
+            ( ( bAppsBrakeFault || ( u8SensorTimeouts != 0U ) ) &&
+              ( ( xTaskGetTickCount() - xLastErrorsTx ) >= pdMS_TO_TICKS( MAIN_ECU_ERRORS_PERIOD_MS ) ) ) )
+        {
+            vSendMainEcuErrors( bAppsBrakeFault, u8SensorTimeouts );
+            bAppsBrakeFaultSent = bAppsBrakeFault;
+            u8SensorTimeoutsSent = u8SensorTimeouts;
+            xLastErrorsTx = xTaskGetTickCount();
+        }
+
+        vRecordLoopTime( portGET_RUN_TIME_COUNTER_VALUE() - ulLoopStart );
 
         vTaskDelay( pdMS_TO_TICKS( DRIVERS_PERIOD_MS ) );
     }
@@ -547,19 +666,16 @@ void vApplicationGetTimerTaskMemory( StaticTask_t **ppxTimerTaskTCBBuffer,
 
 int main( void )
 {
-    const char *pcBootMsg = "TMS570 MAIN ECU (rewrite) INITIALIZED\n";
-
     gioInit();
     canInit();
     sciInit();
     sciSetBaudrate( sciREG, 115200U );
-    sciSend( sciREG, ( uint32 ) strlen( pcBootMsg ), ( uint8 * ) pcBootMsg );
 
-    memset( &xTelemetryData, 0, sizeof( xTelemetryData ) );
+    /* Clears xTelemetryData, so the defaults below go after it. */
+    telemetry_init( PRIO_TELEMETRY );
     xTelemetryData.drive_enabled = false; /* until cmd 7 on 0x600 */
     xTelemetryData.race_mode = false;     /* normal (linear) torque until cmd 0xC */
-    xTelemetryMutex = xSemaphoreCreateMutexStatic( &xTelemetryMutexBuffer );
-    configASSERT( xTelemetryMutex != NULL );
+    xTelemetryData.traction_on = true;    /* traction control on until cmd 0xA */
 
     init_drivers();
     charger_init( PRIO_CHARGER );
@@ -569,9 +685,6 @@ int main( void )
 
     xTaskCreateStatic( vDriversTask, "Drivers", STACK_DRIVERS, NULL,
                         PRIO_DRIVERS, xDriversStack, &xDriversTaskBuffer );
-
-    xTaskCreateStatic( vTelemetryTask, "Telemetry", STACK_TELEMETRY, NULL,
-                        PRIO_TELEMETRY, xTelemetryStack, &xTelemetryTaskBuffer );
 
     vTaskStartScheduler();
 

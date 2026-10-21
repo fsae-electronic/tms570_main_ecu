@@ -26,6 +26,14 @@ CPU_FLAGS = -mcpu=cortex-r4 -mfpu=vfpv3-d16 -mfloat-abi=hard -mbig-endian -mbe32
 CFLAGS  = $(CPU_FLAGS) -Os -Wall -Wextra -ffunction-sections -fdata-sections -g3 $(EXTRA_DEFS)
 ASFLAGS = $(CPU_FLAGS) -x assembler-with-cpp
 
+# Firmware identity for the telemetry slow frame (build.bat passes these).
+ifneq ($(GIT_HASH),)
+  EXTRA_DEFS += -DFW_GIT_HASH=0x$(GIT_HASH)U
+endif
+ifneq ($(FW_DIRTY),)
+  EXTRA_DEFS += -DFW_DIRTY=$(FW_DIRTY)U
+endif
+
 LDSCRIPT = linker/link.ld
 LDFLAGS  = $(CPU_FLAGS) -nostartfiles -Wl,--gc-sections -Wl,-Map=$(TARGET).map -T $(LDSCRIPT)
 

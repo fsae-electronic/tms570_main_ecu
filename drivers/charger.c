@@ -8,7 +8,7 @@
 #define CHARGER_RX_MAILBOX      canMESSAGE_BOX1
 #define CHARGER_TX_MAILBOX      canMESSAGE_BOX2
 
-/* CAN1 mailboxes (vehicle bus) -- canInit() uses boxes 1-24 and 27 there. */
+/* CAN1 mailboxes (vehicle bus) -- canInit() uses boxes 1-24 and 27-28 there. */
 #define CHARGER_CMD_MAILBOX     canMESSAGE_BOX25
 #define CHARGER_DATA_MAILBOX    canMESSAGE_BOX26
 

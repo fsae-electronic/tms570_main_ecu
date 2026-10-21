@@ -113,6 +113,22 @@ static void canConfigureTxMailbox( uint32 boxNum, uint32 dlc )
     canREG1->IF1NO   = ( uint8 ) boxNum;
 }
 
+/* TX mailbox with a fixed standard ID (unlike canConfigureTxMailbox(),
+ * whose ID canopen.c rewrites before every send). */
+static void canConfigureTxMailboxId( uint32 boxNum, uint32 id, uint32 dlc )
+{
+    /*SAFETYMCUSW 28 D MR:NA <APPROVED> "Potentially infinite loop found - Hardware Status check for execution sequence" */
+    while ( ( canREG1->IF1STAT & 0x80U ) == 0x80U )
+    {
+    } /* Wait */
+
+    canREG1->IF1MSK  = canSTD_ID_MSK;
+    canREG1->IF1ARB  = 0x80000000U | 0x20000000U | canSTD_ID( id );
+    canREG1->IF1MCTL = 0x00000080U | ( dlc & 0xFU );
+    canREG1->IF1CMD  = ( uint8 ) 0xF8U;
+    canREG1->IF1NO   = ( uint8 ) boxNum;
+}
+
 /** @fn void canInit(void)
 *   @brief Initializes CAN Driver
 *
@@ -376,6 +392,9 @@ void canInit(void)
     /* Message box 27 (25-26 are the charger's TX boxes, see charger.c):
      * implausibility errors from the adc2can boards. */
     canConfigureRxMailbox( 27U, CAN_ID_SENSOR_ERRORS );
+
+    /* Message box 28: main ECU errors to the on-board ECU. */
+    canConfigureTxMailboxId( 28U, CAN_ID_MAIN_ECU_ERRORS, 8U );
 
     /** - Setup IF1 for data transmission
     *     - Wait until IF1 is ready for use 
