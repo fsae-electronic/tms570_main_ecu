@@ -20,12 +20,13 @@
  * reads them -- it only ever sees the last one. */
 #define INIT_STEP_GAP_MS 5U
 
-/* Torque RPDO rate once a drive is in DRIVE: run_drivers() itself is
- * polled much faster (see DRIVERS_PERIOD_MS in main.c) so the state
- * machine stays responsive, but sending torque at that same rate for both
- * nodes was needlessly loading the bus -- 20 Hz for the torque setpoint.
+/* Torque RPDO rate once a drive is in DRIVE: same as DRIVERS_PERIOD_MS
+ * (main.c), so every traction control update reaches the drives. At 50 ms
+ * the TC cut could move up to 0.5 between frames (rise rate 10 / s at TC
+ * Cut 5) and the drive saw it as one step; at 10 ms the step is 0.1. Two
+ * RXPDO1 at 100 Hz are ~26 kbit/s, under 3 % of CAN1 at 1 Mbit/s.
  * Keep TORQUE_SEND_PERIOD_MS in tools/torque_sim.py in sync. */
-#define TORQUE_SEND_PERIOD_MS 50U
+#define TORQUE_SEND_PERIOD_MS 10U
 
 typedef enum
 {

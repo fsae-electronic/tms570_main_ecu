@@ -12,8 +12,9 @@ ECU (every 10 ms, same logic and integer casts as the firmware):
   * Race mode:   s16RaceTorqueMap() per motor (KV_EMRAX, MAX_DC_CURRENT,
                  driver_dc_voltage, motor_rated_current)
   * Traction control: traction_apply() -- slip ratio + PI per rear motor
-  * Torque is only sent to the drives every 50 ms (TORQUE_SEND_PERIOD_MS
-    in drivers.c); in between the drive holds the last value.
+  * Torque is sent to the drives every 10 ms (TORQUE_SEND_PERIOD_MS in
+    drivers.c, same as DRIVERS_PERIOD_MS); in between the drive holds the
+    last value.
 Car (1D longitudinal, simple physics just to have something to control):
   * Two rear motors through a fixed reduction, front wheels free rolling.
   * Tire force from a simplified Pacejka curve, one mu per rear wheel so a

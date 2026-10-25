@@ -69,7 +69,7 @@ IMD and BMS are hardware and stay outside this board, as the rules require.
 ## Features
 
 - **Two-motor torque control** over CANopen / CiA 402 (node 1 = left,
-  node 2 = right), with a 50 ms torque setpoint.
+  node 2 = right), with a 10 ms torque setpoint.
 - **Two driving modes:** *normal* (linear, capped at the DC current limit)
   and *race* (follows the pedal, then holds the DC current near the limit
   at high speed).
@@ -180,7 +180,7 @@ against the team's "Mensajes CAN" spec and measured on the car.
 | ID | To | Content |
 |---|---|---|
 | `0x000` | drives | NMT: `0x01` operational, `0x80` pre-operational |
-| `0x201` / `0x202` | drives (RXPDO1) | B0-1 control word, B2-3 target torque (per mille of rated torque, int16). The wire sign is inverted (`-torque`) to match how the motors are mounted |
+| `0x201` / `0x202` | drives (RXPDO1) | B0-1 control word, B2-3 target torque (per mille of rated torque, int16). Every 10 ms in DRIVE. The wire sign is inverted (`-torque`) to match how the motors are mounted |
 | `0x403` | on-board ECU | B0 = 1 while EV.4.7 is active. B1 = sensor timeout bits: bit 0 `0x501`, bit 1 `0x502`, bit 2 `0x504`. Sent on every change, then every 100 ms while any fault is active |
 | `0x610` | on-board ECU | B0 1 = charging / 0 = not charging, B1 charger status flags. Every 500 ms while charging, plus once when charging stops |
 | `0x611` | on-board ECU | B0-1 commanded voltage, B2-3 commanded current, B4-5 measured voltage, B6-7 measured current (all 0.1 V or 0.1 A per bit). Every 500 ms while charging |
@@ -229,7 +229,7 @@ It also sends `TMS570 MAIN ECU (rewrite) INITIALIZED` over the UART.
    │  STOP    │                                            │  DRIVE    │
    │ pre-op,  │ ◀───────────────────────────────────────── │ torque    │
    │ no torque│  cmd 0x08, 0x401 fault, sensor timeout,    │ every     │
-   └──────────┘  EV.4.7 (brake + pedal > 25 %)              │ 50 ms     │
+   └──────────┘  EV.4.7 (brake + pedal > 25 %)              │ 10 ms     │
                                                            └───────────┘
 ```
 
@@ -241,7 +241,9 @@ drive, with 5 ms between frames:
 3. Control word `0x0007` (Switch On)
 4. Control word `0x000F` (Enable Operation)
 
-After that it sends `0x000F` + target torque on RXPDO1 every **50 ms**.
+After that it sends `0x000F` + target torque on RXPDO1 every **10 ms**,
+the same period as the drivers task, so every traction control update
+reaches the drives.
 When drive is disabled, both nodes get NMT **pre-operational**.
 
 Every fault forces drive **off**. Getting back needs a new drive-on
@@ -470,7 +472,7 @@ sent, so the radio can be configured from XCTU. Set it back to 0 afterwards.
 | `APPS_BRAKE_TRIP_PCT` / `_RESET_PCT` | `app/main.c` | 25 % / 5 % | EV.4.7 thresholds |
 | `SENSOR_CAN_TIMEOUT_MS` | `app/main.c` | 100 ms | APPS / brake frame timeout |
 | `CAN_RX_PERIOD_MS`, `DRIVERS_PERIOD_MS` | `app/main.c` | 10 ms | Task periods |
-| `TORQUE_SEND_PERIOD_MS` | `drivers/drivers.c` | 50 ms | RXPDO1 torque rate (keep in sync with `tools/torque_sim.py`) |
+| `TORQUE_SEND_PERIOD_MS` | `drivers/drivers.c` | 10 ms | RXPDO1 torque rate (keep in sync with `tools/torque_sim.py`) |
 | `TC_*` | `app/traction.h` | see above | Traction control |
 | `TELEMETRY_PERIOD_MS`, `XBEE_CONFIG_MODE` | `app/telemetry.c` | 10 ms, 0 | Telemetry |
 | `CHARGER_CELL_COUNT`, `CHARGER_CELL_MAX_VOLTAGE` | `include/charger.h` | 29, 3.65 V | Charge voltage |
