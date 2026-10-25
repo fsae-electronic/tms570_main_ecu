@@ -1,5 +1,35 @@
 #include "traction.h"
 
+/* TC (TC1) level -> slip allowed before cutting. [0] unused (TC off). */
+static const float s_tc_target_slip[ TC_LEVEL_MAX + 1U ] =
+{
+    0.0f, 0.40f, 0.34f, 0.29f, 0.24f, 0.20f, 0.17f, 0.14f, 0.11f, 0.08f, 0.06f
+};
+
+/* TC Cut (TC2) level -> how hard the cut bites. [0] unused. */
+typedef struct
+{
+    float kp;        /* torque cut per unit of slip error */
+    float ki;        /* integral build-up per unit of slip error per second */
+    float max_cut;   /* never cut more than this fraction of the request */
+    float rise_rate; /* max cut increase per second */
+} TcCutLevel_t;
+
+static const TcCutLevel_t s_tc_cut[ TC_CUT_LEVEL_MAX + 1U ] =
+{
+    { 0.0f,  0.0f,  0.0f,  0.0f },
+    { 0.3f,  1.0f,  0.40f, 4.0f },
+    { 0.4f,  1.5f,  0.50f, 5.0f },
+    { 0.5f,  2.0f,  0.60f, 6.5f },
+    { 0.65f, 2.5f,  0.70f, 8.0f },
+    { 0.8f,  3.0f,  0.80f, 10.0f }, /* 0 -> 80 % in ~80 ms; launch slip reaches ~1 in ~140 ms */
+    { 1.0f,  4.0f,  0.85f, 12.0f },
+    { 1.2f,  5.0f,  0.90f, 15.0f },
+    { 1.5f,  6.5f,  0.90f, 18.0f },
+    { 1.8f,  8.0f,  0.95f, 22.0f },
+    { 2.2f,  10.0f, 0.95f, 25.0f }
+};
+
 static float s_integral[ 2 ];
 static float s_front_f;
 static bool  s_front_seeded;
@@ -23,9 +53,9 @@ static float clamp( float x, float lo, float hi )
 
 /* Move the applied cut towards target without stepping faster than the
  * rise/fall rates allow. */
-static float ramp_cut( float cut, float target, float dt_s )
+static float ramp_cut( float cut, float target, float rise_rate, float dt_s )
 {
-    float max_up = TC_CUT_RISE_RATE * dt_s;
+    float max_up = rise_rate * dt_s;
     float max_down = TC_CUT_FALL_RATE * dt_s;
 
     return cut + clamp( target - cut, -max_down, max_up );
@@ -44,7 +74,7 @@ static void release_wheel( uint32_t n, int16_t torque[ 2 ], float dt_s )
 {
     s_integral[ n ] = 0.0f;
     s_slip[ n ] = 0.0f;
-    s_cut[ n ] = ramp_cut( s_cut[ n ], 0.0f, dt_s );
+    s_cut[ n ] = ramp_cut( s_cut[ n ], 0.0f, 0.0f, dt_s );
 
     torque[ n ] = ( int16_t ) ( ( float ) torque[ n ] * ( 1.0f - s_cut[ n ] ) );
 }
@@ -60,10 +90,13 @@ void traction_apply( const TelemetrySnapshot_t *data, int16_t torque[ 2 ], float
 {
     float front[ 2 ];
     float rear[ 2 ];
+    float target_slip;
+    const TcCutLevel_t *cut_level;
     uint32_t n;
 
-    /* No ground speed reference -> can't compute slip, fade any cut out. */
-    if( !data->front_axle_valid )
+    /* TC level 0 (off), or no ground speed reference -> can't compute
+     * slip, fade any cut out. */
+    if( ( data->tc_level == 0U ) || !data->front_axle_valid )
     {
         release_wheel( 0U, torque, dt_s );
         release_wheel( 1U, torque, dt_s );
@@ -83,6 +116,11 @@ void traction_apply( const TelemetrySnapshot_t *data, int16_t torque[ 2 ], float
     {
         s_front_f += ( ( float ) data->front_axle.wheel_speed_fl - s_front_f ) * dt_s / ( TC_FRONT_TAU_S + dt_s );
     }
+    target_slip = s_tc_target_slip[ ( data->tc_level > TC_LEVEL_MAX ) ? TC_LEVEL_MAX : data->tc_level ];
+    cut_level = &s_tc_cut[ ( data->tc_cut_level < TC_CUT_LEVEL_MIN ) ? TC_CUT_LEVEL_MIN :
+                           ( data->tc_cut_level > TC_CUT_LEVEL_MAX ) ? TC_CUT_LEVEL_MAX :
+                           data->tc_cut_level ];
+
     front[ 0 ] = s_front_f;
     front[ 1 ] = s_front_f;
     rear[ 0 ]  = ( float ) data->rear.wheel_speed_rl;
@@ -101,12 +139,12 @@ void traction_apply( const TelemetrySnapshot_t *data, int16_t torque[ 2 ], float
         }
 
         s_slip[ n ] = ( rear[ n ] - front[ n ] - TC_SLIP_SPEED_ALLOW ) / rear[ n ];
-        error = s_slip[ n ] - TC_TARGET_SLIP;
+        error = s_slip[ n ] - target_slip;
 
-        ki = ( error > 0.0f ) ? TC_KI : TC_KI_RELEASE;
-        s_integral[ n ] = clamp( s_integral[ n ] + ( ki * error * dt_s ), 0.0f, TC_MAX_CUT );
-        target = clamp( ( TC_KP * error ) + s_integral[ n ], 0.0f, TC_MAX_CUT );
-        s_cut[ n ] = ramp_cut( s_cut[ n ], target, dt_s );
+        ki = ( error > 0.0f ) ? cut_level->ki : TC_KI_RELEASE;
+        s_integral[ n ] = clamp( s_integral[ n ] + ( ki * error * dt_s ), 0.0f, cut_level->max_cut );
+        target = clamp( ( cut_level->kp * error ) + s_integral[ n ], 0.0f, cut_level->max_cut );
+        s_cut[ n ] = ramp_cut( s_cut[ n ], target, cut_level->rise_rate, dt_s );
 
         torque[ n ] = ( int16_t ) ( ( float ) torque[ n ] * ( 1.0f - s_cut[ n ] ) );
     }

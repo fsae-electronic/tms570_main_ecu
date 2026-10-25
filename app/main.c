@@ -314,6 +314,23 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
             xSemaphoreGive( xTelemetryMutex );
         }
 
+        /* CAN ID 0x6A0: B0 TC level, B1 TC Cut level (traction.h). A
+         * byte out of range -- e.g. 0xFF -- leaves that level as it was,
+         * so either one can be changed on its own. */
+        if( canGetData( canREG1, canMESSAGE_BOX29, raw ) != 0U )
+        {
+            xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
+            if( raw[ 0 ] <= TC_LEVEL_MAX )
+            {
+                xTelemetryData.tc_level = raw[ 0 ];
+            }
+            if( ( raw[ 1 ] >= TC_CUT_LEVEL_MIN ) && ( raw[ 1 ] <= TC_CUT_LEVEL_MAX ) )
+            {
+                xTelemetryData.tc_cut_level = raw[ 1 ];
+            }
+            xSemaphoreGive( xTelemetryMutex );
+        }
+
         /* CAN ID 0x401: TPS / brake implausibility, detected by the
          * adc2can boards and sent once per fault. Stop the car by forcing
          * drive off, exactly as if cmd 8 had arrived -- it stays stopped
@@ -561,7 +578,8 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
         xTelemetryData.torque_request[ 1 ] = s16Torque[ 1 ];
 
         /* Traction control (cmd 9 on / 0xA off): cuts each motor's
-         * request while its rear wheel slips past the target. */
+         * request while its rear wheel slips past the target. TC / TC Cut
+         * levels from 0x6A0 tune when and how hard (TC 0 = off too). */
         if( xTelemetryData.traction_on && bDriveEnabled )
         {
             traction_apply( &xTelemetryData, s16Torque, ( float ) DRIVERS_PERIOD_MS / 1000.0f );
@@ -676,6 +694,8 @@ int main( void )
     xTelemetryData.drive_enabled = false; /* until cmd 7 on 0x600 */
     xTelemetryData.race_mode = false;     /* normal (linear) torque until cmd 0xC */
     xTelemetryData.traction_on = true;    /* traction control on until cmd 0xA */
+    xTelemetryData.tc_level = TC_LEVEL_DEFAULT;         /* until 0x6A0 */
+    xTelemetryData.tc_cut_level = TC_CUT_LEVEL_DEFAULT;
 
     init_drivers();
     charger_init( PRIO_CHARGER );

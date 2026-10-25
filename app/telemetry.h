@@ -26,6 +26,7 @@
 #define CAN_ID_CALIBRATION   0x600U /* on-board ECU: calibration command */
 #define CAN_ID_SENSOR_ERRORS 0x401U /* adc2can_front/rear, sent once per fault: B0 TPS implausibility, B1 brake implausibility */
 #define CAN_ID_MAIN_ECU_ERRORS 0x403U /* main ECU -> on-board ECU: B0 EV.4.7 APPS/brake plausibility active */
+#define CAN_ID_TC_CONFIG     0x6A0U /* on-board ECU: B0 TC level 0-10, B1 TC Cut level 1-10 (0xFF = keep). Not 0x601/0x602: those are the drives' SDO RX */
 
 /* Driver PDO IDs are base + node, node 1 = left, node 2 = right. */
 #define CAN_ID_RXPDO1_BASE   0x200U /* control word / target torque (commanded) */
@@ -132,6 +133,8 @@ typedef struct
     bool            drive_enabled;   /* last drive cmd on 0x600: 7 on, 8 off (0x401 fault forces off) */
     bool            race_mode;       /* last mode cmd on 0x600: 0xB normal, 0xC race */
     bool            traction_on;     /* last traction cmd on 0x600: 9 on, 0xA off (starts on) */
+    uint8_t         tc_level;        /* TC (TC1) 0-10 from 0x6A0, 0 = off: when TC acts (traction.h) */
+    uint8_t         tc_cut_level;    /* TC Cut (TC2) 1-10 from 0x6A0: how hard TC cuts (traction.h) */
     int16_t         torque_request[ 2 ]; /* mode map output per motor, before TC, 0-1000 */
     int16_t         torque_cmd[ 2 ]; /* torque request per motor after mode map + TC, 0-1000 ([0] left, [1] right) */
     bool            tc_cutting[ 2 ];  /* TC cut this motor's request in the last cycle */

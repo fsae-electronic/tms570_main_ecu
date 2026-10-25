@@ -396,6 +396,9 @@ void canInit(void)
     /* Message box 28: main ECU errors to the on-board ECU. */
     canConfigureTxMailboxId( 28U, CAN_ID_MAIN_ECU_ERRORS, 8U );
 
+    /* Message box 29: traction control TC / TC Cut levels from the on-board ECU. */
+    canConfigureRxMailbox( 29U, CAN_ID_TC_CONFIG );
+
     /** - Setup IF1 for data transmission
     *     - Wait until IF1 is ready for use 
     *     - Set IF1 control byte
