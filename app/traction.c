@@ -31,7 +31,7 @@ static const TcCutLevel_t s_tc_cut[ TC_CUT_LEVEL_MAX + 1U ] =
 };
 
 static float s_integral[ 2 ];
-static float s_front_f;
+static float s_front_f[ 2 ];   /* [0] = FL (ground speed for RL), [1] = FR (for RR) */
 static bool  s_front_seeded;
 
 /* Last computed values, for watching in the debugger. */
@@ -104,25 +104,43 @@ void traction_apply( const TelemetrySnapshot_t *data, int16_t torque[ 2 ], float
         return;
     }
 
-    /* TEST: FR sensor reads wrong, so FL is the ground speed for both
-     * sides. Once FR is fixed, filter each front on its own and use
-     * data->front_axle.wheel_speed_fr for front[ 1 ]. */
+    /* Each rear is compared with the front on its own side, so the inner
+     * and outer wheels of a corner each get their own ground speed. Both
+     * fronts are low-passed separately. */
+    front[ 0 ] = ( float ) data->front_axle.wheel_speed_fl;
+    front[ 1 ] = ( float ) data->front_axle.wheel_speed_fr;
     if( !s_front_seeded )
     {
-        s_front_f = ( float ) data->front_axle.wheel_speed_fl;
+        s_front_f[ 0 ] = front[ 0 ];
+        s_front_f[ 1 ] = front[ 1 ];
         s_front_seeded = true;
     }
     else
     {
-        s_front_f += ( ( float ) data->front_axle.wheel_speed_fl - s_front_f ) * dt_s / ( TC_FRONT_TAU_S + dt_s );
+        for( n = 0U; n < 2U; n++ )
+        {
+            s_front_f[ n ] += ( front[ n ] - s_front_f[ n ] ) * dt_s / ( TC_FRONT_TAU_S + dt_s );
+        }
     }
     target_slip = s_tc_target_slip[ ( data->tc_level > TC_LEVEL_MAX ) ? TC_LEVEL_MAX : data->tc_level ];
     cut_level = &s_tc_cut[ ( data->tc_cut_level < TC_CUT_LEVEL_MIN ) ? TC_CUT_LEVEL_MIN :
                            ( data->tc_cut_level > TC_CUT_LEVEL_MAX ) ? TC_CUT_LEVEL_MAX :
                            data->tc_cut_level ];
 
-    front[ 0 ] = s_front_f;
-    front[ 1 ] = s_front_f;
+    front[ 0 ] = s_front_f[ 0 ];
+    front[ 1 ] = s_front_f[ 1 ];
+
+    /* One front dead (reads ~0 while the other is turning): use the other
+     * one for both sides rather than seeing 100 % slip on that side. */
+    if( ( front[ 0 ] < TC_FRONT_DEAD_RPM ) && ( front[ 1 ] > TC_FRONT_ALIVE_RPM ) )
+    {
+        front[ 0 ] = front[ 1 ];
+    }
+    else if( ( front[ 1 ] < TC_FRONT_DEAD_RPM ) && ( front[ 0 ] > TC_FRONT_ALIVE_RPM ) )
+    {
+        front[ 1 ] = front[ 0 ];
+    }
+
     rear[ 0 ]  = ( float ) data->rear.wheel_speed_rl;
     rear[ 1 ]  = ( float ) data->rear.wheel_speed_rr;
 

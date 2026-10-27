@@ -62,6 +62,11 @@
 #define TC_SLIP_SPEED_ALLOW  10.0f /* rear may run this many rpm over the front before it counts as slip */
 #define TC_CUT_FALL_RATE     3.0f  /* max cut decrease per second (80 % -> 0 in ~270 ms) */
 #define TC_MIN_WHEEL_SPEED   30.0f /* rear wheel speed below which TC is inactive */
+/* A front reading under TC_FRONT_DEAD_RPM while the other front reads over
+ * TC_FRONT_ALIVE_RPM counts as a dead sensor: that side uses the other
+ * front as its ground speed. */
+#define TC_FRONT_DEAD_RPM    3.0f
+#define TC_FRONT_ALIVE_RPM   40.0f
 
 /**
  * @brief Clear both PI integrators. Call whenever TC is off or the motors

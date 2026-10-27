@@ -186,7 +186,9 @@ void muxInit(void){
     
     pinMuxReg->PINMMR8 =    PINMUX_PIN_39_SCITX | PINMUX_PIN_40_MIBSPI1NCS_2 | PINMUX_PIN_41_HET1_15;
     
-    pinMuxReg->PINMMR9 = ((~(pinMuxReg->PINMMR9 >> 18U) & 0x00000001U ) << 18U) | PINMUX_PIN_54_MIBSPI3NENA | PINMUX_PIN_55_GIOB_2;
+    /* Pin 55 back to its default function: with GIOB_2 selected here, GIOB[2]
+     * was taken to pin 55 instead of pin 142, where the board has DO0 (J7 K1). */
+    pinMuxReg->PINMMR9 = PINMUX_PIN_54_MIBSPI3NENA | PINMUX_PIN_55_MIBSPI3NCS_0;
     
     pinMuxReg->PINMMR10 =   PINMUX_PIN_86_AD1EVT;
     

@@ -78,7 +78,7 @@ VALID_BITS = {
 ECU_STATE_BITS = {
     2: "DriveEnabled", 3: "ReadyToDrive", 4: "TC_On", 5: "TC_CutL",
     6: "TC_CutR", 7: "APPS_Implausible", 8: "APPS_Brake", 9: "BrakePressed",
-    10: "SafeMode",
+    10: "SafeMode", 11: "DriverFault", 12: "BrakeLight", 13: "RTDS",
 }
 TORQUE_LIMIT_BITS = {
     0: "DriveDisabled", 1: "APPS", 2: "APPS_Brake", 3: "Traction", 4: "Power",
@@ -92,6 +92,7 @@ TS_STATE_BITS = {
 ACTIVE_FAULT_BITS = {
     0: "TPS_Timeout", 1: "Front_Timeout", 2: "Rear_Timeout",
     3: "SensorImplausible", 4: "APPS_Brake",
+    5: "DriverL_Fault", 6: "DriverR_Fault",
 }
 RESET_CAUSES = {0: "unknown", 1: "power-on", 2: "watchdog", 3: "external",
                 4: "software", 5: "oscillator", 6: "CPU (ESM)", 7: "brown-out"}

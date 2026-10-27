@@ -161,6 +161,9 @@ static StackType_t xTelemetryStack[ STACK_TELEMETRY ];
 #define ECU_STATE_APPS_BRAKE       ( 1U << 8 )  /* EV.4.7 */
 #define ECU_STATE_BRAKE_PRESSED    ( 1U << 9 )
 #define ECU_STATE_SAFE_MODE        ( 1U << 10 ) /* torque forced to 0 by a fault */
+#define ECU_STATE_DRIVER_FAULT     ( 1U << 11 ) /* a drive faulted or dropped out in DRIVE */
+#define ECU_STATE_BRAKE_LIGHT      ( 1U << 12 ) /* brake light output on */
+#define ECU_STATE_RTDS             ( 1U << 13 ) /* Ready to Drive sound output on */
 
 #define TORQUE_LIMIT_DRIVE_DISABLED  ( 1U << 0 )
 #define TORQUE_LIMIT_APPS            ( 1U << 1 )
@@ -172,6 +175,8 @@ static StackType_t xTelemetryStack[ STACK_TELEMETRY ];
 /* active_faults (slow frame): bits 0-2 are SENSOR_TIMEOUT_*. */
 #define ACTIVE_FAULT_SENSOR_IMPLAUSIBLE ( 1UL << 3 ) /* 0x401 latched */
 #define ACTIVE_FAULT_APPS_BRAKE         ( 1UL << 4 ) /* EV.4.7 */
+#define ACTIVE_FAULT_DRIVER_LEFT        ( 1UL << 5 ) /* drive 1 faulted / dropped out */
+#define ACTIVE_FAULT_DRIVER_RIGHT       ( 1UL << 6 ) /* drive 2 faulted / dropped out */
 
 /* CiA 402 status word: "Operation enabled" under mask 0x6F. */
 #define STATUSWORD_STATE_MASK     0x006FU
@@ -341,7 +346,11 @@ static uint16_t usEcuState( const TelemetrySnapshot_t *pxSnapshot )
     if( bAppsImplausible( pxSnapshot ) ) { usState |= ECU_STATE_APPS_IMPLAUSIBLE; }
     if( pxSnapshot->apps_brake_fault )   { usState |= ECU_STATE_APPS_BRAKE; }
     if( pxSnapshot->brake_engaged )      { usState |= ECU_STATE_BRAKE_PRESSED; }
-    if( pxSnapshot->sensor_fault || pxSnapshot->apps_brake_fault || ( pxSnapshot->sensor_timeouts != 0U ) )
+    if( pxSnapshot->driver_faults != 0U ) { usState |= ECU_STATE_DRIVER_FAULT; }
+    if( pxSnapshot->brake_light )        { usState |= ECU_STATE_BRAKE_LIGHT; }
+    if( pxSnapshot->rtds_on )            { usState |= ECU_STATE_RTDS; }
+    if( pxSnapshot->sensor_fault || pxSnapshot->apps_brake_fault || ( pxSnapshot->sensor_timeouts != 0U ) ||
+        ( pxSnapshot->driver_faults != 0U ) )
     {
         usState |= ECU_STATE_SAFE_MODE;
     }
@@ -474,6 +483,8 @@ static void vPackSlowFrame( const TelemetrySnapshot_t *pxSnapshot, TickType_t xN
 
     if( pxSnapshot->sensor_fault )     { ulFaults |= ACTIVE_FAULT_SENSOR_IMPLAUSIBLE; }
     if( pxSnapshot->apps_brake_fault ) { ulFaults |= ACTIVE_FAULT_APPS_BRAKE; }
+    if( ( pxSnapshot->driver_faults & DRIVER_FAULT_LEFT ) != 0U )  { ulFaults |= ACTIVE_FAULT_DRIVER_LEFT; }
+    if( ( pxSnapshot->driver_faults & DRIVER_FAULT_RIGHT ) != 0U ) { ulFaults |= ACTIVE_FAULT_DRIVER_RIGHT; }
 
     vPutHeader( pxFrame, &idx, TELEMETRY_TYPE_SLOW, ucSeq,
                 ( uint8_t ) ( TELEMETRY_SLOW_SIZE - TELEMETRY_HEADER_SIZE - 2U ),

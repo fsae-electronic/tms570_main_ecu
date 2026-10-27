@@ -134,6 +134,12 @@ void init_drivers(void)
     s_drivers[0].state = DRIVER_STATE_STOP;
     s_drivers[1].node_id = DRIVER_NODE_2;
     s_drivers[1].state = DRIVER_STATE_STOP;
+
+    /* After a reset in DRIVE (e.g. the watchdog) the drives may still be
+     * operational with the last torque: send them all to pre-operational.
+     * One broadcast frame (node 0 = all), so it can't block on a busy
+     * mailbox when nothing else is on the bus. */
+    send_nmt_command(NMT_CMD_ENTER_PRE_OPERATIONAL, 0U);
 }
 
 void run_drivers(bool drive_enabled, const int16_t torque_request[2])

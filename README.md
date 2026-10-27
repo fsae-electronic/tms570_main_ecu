@@ -79,6 +79,9 @@ IMD and BMS are hardware and stay outside this board, as the rules require.
   - EV.4.7 APPS / brake plausibility.
   - APPS and brake implausibility reported by the adc2can boards.
   - 100 ms timeouts on the APPS and brake frames.
+  - A fault or dropout of either drive stops both motors.
+  - Hardware watchdog (RTI DWD): a hung task or CPU resets the MCU.
+- **Ready to Drive sound** (DO0) and **brake light** (DO1) outputs.
 - **Fault reporting** to the dashboard on CAN ID 0x403.
 - **Charger control** on a second CAN bus (CAN2), with status reports to the
   dashboard.
@@ -142,12 +145,15 @@ see `app/telemetry.h`):
 | `Drivers` (`app/main.c`) | 2 | 10 ms | Runs the safety checks, the torque map and traction control, then calls `run_drivers()` (`drivers/drivers.c`). Sends 0x403 and measures its own loop time. |
 | `Telemetry` (`app/telemetry.c`) | 1 | 10 ms | Takes a consistent copy of the snapshot and sends the fast and slow frames over the UART. |
 | `Charger` (`drivers/charger.c`) | 1 | 50 ms | Sends the charger setpoint on CAN2 and reports charging status on CAN1. |
+| `Watchdog` (`app/watchdog.c`) | 4 | 20 ms | Refreshes the hardware watchdog while `CanRx` and `Drivers` keep checking in (see [Watchdog](#watchdog)). |
 
 CAN is **polled, not interrupt-driven**. `canGetData()` checks the hardware
 NEWDAT flag and returns 0 when there is nothing new, so a short
 `vTaskDelay` loop picks up new frames without any VIM routing. The CAN
 interrupt line is left disabled in `canInit()` on purpose: the
 HALCoGen-generated ISR relies on a TI CGT pragma that GCC doesn't support.
+
+A fifth task, `Watchdog`, only supervises the others.
 
 All tasks and the mutex are allocated **statically**
 (`configSUPPORT_STATIC_ALLOCATION`).
@@ -181,7 +187,7 @@ against the team's "Mensajes CAN" spec and measured on the car.
 |---|---|---|
 | `0x000` | drives | NMT: `0x01` operational, `0x80` pre-operational |
 | `0x201` / `0x202` | drives (RXPDO1) | B0-1 control word, B2-3 target torque (per mille of rated torque, int16). Every 10 ms in DRIVE. The wire sign is inverted (`-torque`) to match how the motors are mounted |
-| `0x403` | on-board ECU | B0 = 1 while EV.4.7 is active. B1 = sensor timeout bits: bit 0 `0x501`, bit 1 `0x502`, bit 2 `0x504`. Sent on every change, then every 100 ms while any fault is active |
+| `0x403` | on-board ECU | B0 = 1 while EV.4.7 is active. B1 = sensor timeout bits: bit 0 `0x501`, bit 1 `0x502`, bit 2 `0x504`. B2 = drive fault bits: bit 0 left (node 1), bit 1 right (node 2). Sent on every change, then every 100 ms while any fault is active |
 | `0x610` | on-board ECU | B0 1 = charging / 0 = not charging, B1 charger status flags. Every 500 ms while charging, plus once when charging stops |
 | `0x611` | on-board ECU | B0-1 commanded voltage, B2-3 commanded current, B4-5 measured voltage, B6-7 measured current (all 0.1 V or 0.1 A per bit). Every 500 ms while charging |
 
@@ -200,7 +206,7 @@ Byte 0 of `0x600`, the same values as the on-board ECU's
 | B0 | Action |
 |---|---|
 | `0x01`-`0x06` | Sensor calibrations for the adc2can boards (ignored here) |
-| `0x07` | **Drive ON.** Clears a latched 0x401 fault and starts the drive enable sequence |
+| `0x07` | **Drive ON.** Clears a latched 0x401 or drive fault and starts the drive enable sequence |
 | `0x08` | **Drive OFF.** Drives go back to pre-operational |
 | `0x09` / `0x0A` | Traction control ON / OFF |
 | `0x0B` / `0x0C` | Normal mode / race mode |
@@ -271,6 +277,49 @@ start button pushed.
    5 %. That re-enabled the inverters with the car still rolling and
    tripped both with gate-driver faults (`0xFF06` / `0xFF0A`), so restart
    now always goes through the normal start sequence.
+4. **Drive faults.** While in DRIVE, both motors stop (drive forced off,
+   `0x403` B2, latched until the next `0x07`) if either drive:
+   - sends a TXPDO1 with `error` ≠ 0 or the CiA 402 *Fault* bit (0x0008)
+     in the status word,
+   - stops sending TXPDO2 (every 10 ms) for more than **100 ms**.
+
+   The drives' heartbeat isn't checked because it doesn't work on the car.
+   A drive that reboots still trips the TXPDO2 timeout, since it sends no
+   PDOs until it's back in operational.
+
+   Frames from the first **300 ms** after drive-on are ignored, while the
+   drives go through NMT operational and the enable sequence. If a drive is
+   still in fault, the next `0x07` trips again after those 300 ms. The
+   enable sequence doesn't send a CiA 402 fault reset (`0x0080`), so a
+   drive that latched a fault has to be cleared on the drive side.
+
+### Outputs
+
+| Output | J7 | MCU | Behaviour |
+|---|---|---|---|
+| DO0 | K1 | GIOB[2], pin 142 | **Ready to Drive sound** (EV.10.7): on for `RTDS_DURATION_MS` (2 s) each time drive goes on, off early if drive goes off |
+| DO1 | J1 | GIOB[3], pin 1 | **Brake light**: on above `BRAKE_LIGHT_ON_PSI` (20 psi) on either brake line, off below `BRAKE_LIGHT_OFF_PSI` (10 psi). Only fresh `0x502` / `0x504` frames count |
+
+Both are low-side: wire the buzzer and the lamp between +GLV and the pin.
+`startup/pinmux.c` leaves pin 55 on its default function so GIOB[2] stays
+on pin 142. Bench-check both outputs before the first run. Calibrate the
+brake light thresholds on the car so the lamp comes on with the lightest
+pedal press.
+
+### Watchdog
+
+`app/watchdog.c`. A task above all the others (priority 4) refreshes the
+RTI digital watchdog every 20 ms, but only while `CanRx` and `Drivers`
+have both checked in during the last 60 ms. If either task hangs (for
+example in the busy-wait of a CAN mailbox that never empties), or the
+whole CPU does, the DWD expires (about 100 ms, `WATCHDOG_DWD_PRELOAD`) and
+resets the MCU. At boot `init_drivers()` sends a broadcast NMT
+pre-operational, so drives left running by a reset stop, and drive stays
+off until a new `0x07`.
+
+The DWD starts when the scheduler does and can't be stopped until the next
+reset. If a debugger halt makes it reset the board, build with
+`WATCHDOG_ENABLE 0` in `app/watchdog.c`.
 
 ---
 
@@ -351,7 +400,12 @@ torque = torque · (1 − cut)
 - TC stays out of the way below `TC_MIN_WHEEL_SPEED` (30 rpm of rear wheel
   speed), when `0x502` hasn't arrived, or at TC level 0. In those cases any
   cut still applied fades out instead of snapping back.
-- The front speed is low-passed with `TC_FRONT_TAU_S` (30 ms).
+- Each rear wheel is compared with the front wheel on its own side (RL with
+  FL, RR with FR), so in a corner the inner and outer wheels each get their
+  own ground speed. Both fronts are low-passed with `TC_FRONT_TAU_S` (30 ms).
+- If one front reads under `TC_FRONT_DEAD_RPM` (3 rpm) while the other reads
+  over `TC_FRONT_ALIVE_RPM` (40 rpm), that sensor counts as dead and its side
+  uses the other front, instead of seeing 100 % slip.
 - The rise/fall rate limits and `max_cut` stop the torque from stepping
   100 → 0 → 100 in one cycle, which the driver feels as a hit through the
   driveline.
@@ -373,9 +427,6 @@ Like a race car's TC / TC Cut knobs, the dashboard sets two levels on
 A higher TC level steps in earlier. A higher TC Cut level cuts harder and
 faster. 5 / 5 is the default at boot.
 
-> **Test workaround:** the front-right wheel sensor currently reads wrong,
-> so front-left is used as the ground speed for both sides
-> (`traction_apply()`). Once FR is fixed, filter each front on its own.
 
 ---
 
@@ -455,7 +506,8 @@ sent, so the radio can be configured from XCTU. Set it back to 0 afterwards.
 | EV.3.3.1 | 80 kW max | 75 A DC per drive (~16 kW at ~106 V) | ✅ |
 | EV.3.3.3 | No regen below 5 km/h | No regeneration at all | ✅ |
 | EV.10.6.2 | Ready to Drive only with TS active + brake + manual action | Brake + button: on-board ECU. **TS active: not checked** | ⚠️ |
-| EV.10.7 | Ready to Drive sound (1-3 s, ≥ 80 dBA) | **Not implemented** | ❌ |
+| EV.10.7 | Ready to Drive sound (1-3 s, ≥ 80 dBA) | DO0 on for 2 s at drive-on. Loudness depends on the buzzer | ✅ |
+| T.3.4 | Brake light | DO1 from the front / rear brake pressure, 20 / 10 psi hysteresis | ✅ |
 
 ---
 
@@ -471,6 +523,10 @@ sent, so the radio can be configured from XCTU. Set it back to 0 afterwards.
 | `BRAKE_ENGAGED_PSI` | `app/main.c` | 50 psi | "Brake engaged" threshold (EV.4.7) |
 | `APPS_BRAKE_TRIP_PCT` / `_RESET_PCT` | `app/main.c` | 25 % / 5 % | EV.4.7 thresholds |
 | `SENSOR_CAN_TIMEOUT_MS` | `app/main.c` | 100 ms | APPS / brake frame timeout |
+| `RTDS_DURATION_MS` | `app/main.c` | 2000 ms | Ready to Drive sound length (EV.10.7: 1-3 s) |
+| `BRAKE_LIGHT_ON_PSI` / `_OFF_PSI` | `app/main.c` | 20 / 10 psi | Brake light thresholds |
+| `DRIVER_START_GRACE_MS`, `DRIVER_PDO_TIMEOUT_MS` | `app/main.c` | 300 ms, 100 ms | Drive fault monitoring |
+| `WATCHDOG_ENABLE`, `WATCHDOG_DWD_PRELOAD` | `app/watchdog.c` | 1, 976 (~100 ms) | Hardware watchdog |
 | `CAN_RX_PERIOD_MS`, `DRIVERS_PERIOD_MS` | `app/main.c` | 10 ms | Task periods |
 | `TORQUE_SEND_PERIOD_MS` | `drivers/drivers.c` | 10 ms | RXPDO1 torque rate (keep in sync with `tools/torque_sim.py`) |
 | `TC_*` | `app/traction.h` | see above | Traction control |
@@ -481,14 +537,14 @@ sent, so the radio can be configured from XCTU. Set it back to 0 afterwards.
 
 ## Unused board I/O
 
-The board has general-purpose I/O on J7 that the firmware doesn't use yet.
-They are meant for things like a pump or fan relay, the brake light, or a
-Ready to Drive buzzer.
+The board has general-purpose I/O on J7 that the firmware doesn't use yet,
+apart from DO0 (Ready to Drive sound) and DO1 (brake light), see
+[Outputs](#outputs). They are meant for things like a pump or fan relay.
 
 | I/O | Electrical | MCU pins | How to use from code |
 |---|---|---|---|
 | **DI0-7** digital inputs | 5 V, active high, opto-isolated (~8 mA at 5 V). Don't connect 12/24 V | DI0-5: GIOA[0,1,2,5,6,7]; DI6-7: GIOB[0,1] | `gioGetBit(gioPORTA, bit)` / `gioGetBit(gioPORTB, bit)`. `gioInit()` already sets them as inputs |
-| **DO0-7** digital outputs | Low-side: load between +GLV and DOx. NCV8405 (current limit, thermal shutdown, 42 V clamp for inductive loads), 3 A fast fuse per output; ≤ 2 A continuous recommended. Off during reset | DO0-1: GIOB[2,3]; DO2-7: N2HET1[0..5] | `gioSetDirection(gioPORTB, 0x0C)` + `gioSetBit(gioPORTB, 2, 1)`; `gioSetDirection(hetPORT1, 0x3F)` + `gioSetBit(hetPORT1, n, 1)`. **The current `pinmux.c` maps pins 23/24/25/30/31 to SPI4 and GIOB[2] to pin 55, so regenerate the pinmux in HALCoGen first** |
+| **DO0-7** digital outputs | Low-side: load between +GLV and DOx. NCV8405 (current limit, thermal shutdown, 42 V clamp for inductive loads), 3 A fast fuse per output; ≤ 2 A continuous recommended. Off during reset | DO0-1: GIOB[2,3]; DO2-7: N2HET1[0..5] | `gioSetDirection(gioPORTB, 0x0C)` + `gioSetBit(gioPORTB, 2, 1)`; `gioSetDirection(hetPORT1, 0x3F)` + `gioSetBit(hetPORT1, n, 1)`. DO0-1 are already set up in `main()`. **The current `pinmux.c` maps pins 23/24/25/30/31 (DO2-5, DO7) to SPI4, so regenerate the pinmux in HALCoGen before using DO2-7** |
 | **AI0-7** analog inputs | 0-5 V, 100 kΩ to GND (open input reads 0 V), clamped, buffered, 2/3 divider, ~24 Hz RC filter; ~1.2 mV per count at the pin | AD1IN[0..7] | Add HALCoGen `adc.c` (group 1 = channels 0-7): `adcStartConversion(adcREG1, adcGROUP1)` → `adcGetData(...)`. `V_in = raw · 3.3 / 4095 · 1.5` |
 | **FREQ1-2** frequency inputs | Hall (open collector, pull-up on board) or VR sensor on a toothed wheel | FREQ1: N2HET1[15] (pin 41); FREQ2: N2HET1[10] (pin 118) | Add HALCoGen `het.c` with capture channels on those pins: `capGetSignal(hetRAM1, capN, &sig)` gives the period in µs. `rpm = 60e6 / (period_us · N_teeth)`. Use a timeout (no edge for ~200 ms → 0 rpm). At high speed, count edges over a fixed window instead (`edgeGetCounter()`) |
 
@@ -501,8 +557,9 @@ Ready to Drive buzzer.
 ## Repository structure
 
 ```
-app/          Application: main.c (CAN RX, safety logic, torque maps, drivers task),
-              traction.c/.h (traction control), telemetry.c/.h (shared snapshot + UART frames)
+app/          Application: main.c (CAN RX, safety logic, torque maps, drivers task, DO0/DO1),
+              traction.c/.h (traction control), telemetry.c/.h (shared snapshot + UART frames),
+              watchdog.c/.h (RTI digital watchdog)
 drivers/      Peripheral drivers (CAN, SCI, GIO, RTI) -- HALCoGen-seeded, hand-fixed for GCC;
               canopen.c (NMT/SDO/PDO), drivers.c (CiA 402 drive state machine), charger.c (CAN2)
 startup/      CPU/system init, VIM interrupt table, HALCoGen-generated device code
@@ -573,10 +630,12 @@ To reset the board by hand, short the **J_RST** jumper.
 - **Ready to Drive (EV.10.6.2):** nothing checks that the Tractive System
   is active before drive-on. It could be done in the on-board ECU, or here
   from the DC-link voltage the drives report in TXPDO2.
-- **Ready to Drive sound (EV.10.7):** not implemented. One option is a
-  buzzer on a DO output.
-- **Front-right wheel speed:** the sensor reads wrong, so TC uses
-  front-left for both sides (test workaround in `traction.c`).
+- **Reset cause:** the slow frame's `last_reset_cause` is still 0. The
+  startup code clears SYSESR before `main()`, so a watchdog reset can't be
+  told apart from a power-on yet.
+- **Front-right wheel speed:** check that the FR sensor reads right before
+  relying on TC. If it reads 0, TC falls back to FL for both sides; if it
+  reads a wrong non-zero value, that side's slip will be wrong.
 - **Telemetry bandwidth:** a 130-byte fast frame takes about 11 ms at
   115200 baud, which is longer than its 10 ms period. The effective rate is
   limited by the UART.

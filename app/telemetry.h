@@ -25,7 +25,7 @@
 #define CAN_ID_REAR_DATA     0x504U /* adc2can_rear: rear brake pressure */
 #define CAN_ID_CALIBRATION   0x600U /* on-board ECU: calibration command */
 #define CAN_ID_SENSOR_ERRORS 0x401U /* adc2can_front/rear, sent once per fault: B0 TPS implausibility, B1 brake implausibility */
-#define CAN_ID_MAIN_ECU_ERRORS 0x403U /* main ECU -> on-board ECU: B0 EV.4.7 APPS/brake plausibility active */
+#define CAN_ID_MAIN_ECU_ERRORS 0x403U /* main ECU -> on-board ECU: B0 EV.4.7 APPS/brake plausibility active, B1 SENSOR_TIMEOUT_*, B2 DRIVER_FAULT_* */
 #define CAN_ID_TC_CONFIG     0x6A0U /* on-board ECU: B0 TC level 0-10, B1 TC Cut level 1-10 (0xFF = keep). Not 0x601/0x602: those are the drives' SDO RX */
 
 /* Driver PDO IDs are base + node, node 1 = left, node 2 = right. */
@@ -40,6 +40,12 @@
 #define SENSOR_TIMEOUT_TPS      ( 1U << 0 ) /* 0x501 */
 #define SENSOR_TIMEOUT_FRONT    ( 1U << 1 ) /* 0x502 */
 #define SENSOR_TIMEOUT_REAR     ( 1U << 2 ) /* 0x504 */
+
+/* TelemetrySnapshot_t.driver_faults bits (set by main.c's drivers task):
+ * a drive faulted or dropped out while in DRIVE, both motors stopped.
+ * Latched until the next drive-on (cmd 7). */
+#define DRIVER_FAULT_LEFT       ( 1U << 0 ) /* node 1 */
+#define DRIVER_FAULT_RIGHT      ( 1U << 1 ) /* node 2 */
 
 typedef struct
 {
@@ -143,6 +149,9 @@ typedef struct
     bool            apps_brake_fault; /* EV.4.7 APPS / brake plausibility: motors stopped */
     bool            sensor_fault;     /* 0x401 TPS/brake implausibility, latched until the next drive-on */
     uint8_t         sensor_timeouts;  /* SENSOR_TIMEOUT_* bits: sensor frames missing */
+    uint8_t         driver_faults;    /* DRIVER_FAULT_* bits, latched until the next drive-on */
+    bool            brake_light;      /* brake light output (DO1) on */
+    bool            rtds_on;          /* Ready to Drive sound output (DO0) on */
     uint16_t        loop_overruns;    /* drivers loop iterations longer than its period, since boot (saturates) */
     uint16_t        loop_time_max_us; /* worst drivers loop iteration; cleared by each slow frame */
     DriverNode_t    driver[ 2 ]; /* [0] = left/node1, [1] = right/node2 */

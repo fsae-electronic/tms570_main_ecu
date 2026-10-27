@@ -29,6 +29,7 @@
 
 #include "telemetry.h"
 #include "traction.h"
+#include "watchdog.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -39,6 +40,7 @@
 #define PRIO_DRIVERS      2U
 #define PRIO_TELEMETRY    1U
 #define PRIO_CHARGER      1U
+#define PRIO_WATCHDOG     4U  /* above everything it supervises (watchdog.c) */
 
 #define STACK_CAN_RX       256U
 #define STACK_DRIVERS      256U
@@ -88,6 +90,41 @@
  * the edge (or booted late) still shows it. */
 #define MAIN_ECU_ERRORS_MAILBOX     canMESSAGE_BOX28
 #define MAIN_ECU_ERRORS_PERIOD_MS   100U
+
+/* Board outputs (J7, low-side NCV8405: load between +GLV and the pin).
+ * DO0 = GIOB[2] (MCU pin 142) on J7 K1, DO1 = GIOB[3] (MCU pin 1) on J7 J1
+ * (pinmux.c keeps pin 55 off GIOB[2] for this).
+ * GIOB[0-1] stay inputs (DI6-7). */
+#define DO_PORT                 gioPORTB
+#define DO_RTDS_BIT             2U   /* DO0: Ready to Drive sound */
+#define DO_BRAKE_LIGHT_BIT      3U   /* DO1: brake light */
+#define DO_DIRECTION_MASK       ( ( 1U << DO_RTDS_BIT ) | ( 1U << DO_BRAKE_LIGHT_BIT ) )
+
+/* EV.10.7: the Ready to Drive sound plays for 1-3 s when the car enters
+ * Ready to Drive (drive goes on). It stops early if drive goes off. */
+#define RTDS_DURATION_MS        2000U
+
+/* Brake light: on above BRAKE_LIGHT_ON_PSI on either line, off again
+ * below BRAKE_LIGHT_OFF_PSI (hysteresis against sensor noise). Lower than
+ * BRAKE_ENGAGED_PSI on purpose: the light has to come on with any brake
+ * actuation. Only fresh frames count (see SENSOR_CAN_TIMEOUT_MS).
+ * Calibrate on the car: light just on with the lightest pedal press. */
+#define BRAKE_LIGHT_ON_PSI      20U
+#define BRAKE_LIGHT_OFF_PSI     10U
+
+/* Drive fault monitoring, only while in DRIVE. Any of these on either
+ * drive forces drive off for BOTH motors (DRIVER_FAULT_* in 0x403 B2),
+ * latched until the next drive-on (cmd 7):
+ *   - TXPDO1 with error != 0 or the CiA 402 Fault bit in the status word
+ *   - no TXPDO2 (sent every 10 ms in operational) for DRIVER_PDO_TIMEOUT_MS
+ * The drives' heartbeat isn't used: it doesn't work on the car. A rebooted
+ * drive still shows up as a TXPDO2 timeout (no PDOs in pre-operational).
+ * Frames from the first DRIVER_START_GRACE_MS after drive-on are ignored:
+ * the drive is still going through NMT operational + the CiA 402 enable
+ * sequence (~15 ms) and may still send the old state. */
+#define DRIVER_START_GRACE_MS   300U
+#define DRIVER_PDO_TIMEOUT_MS   100U
+#define STATUSWORD_FAULT_BIT    0x0008U
 
 /* Motor turns per rear wheel turn: rear wheel speed = motor_velocity /
  * GEAR_RATIO, in wheel RPM like the fronts (needed for the slip ratio). */
@@ -282,6 +319,7 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
             {
                 xTelemetryData.drive_enabled = true;
                 xTelemetryData.sensor_fault = false;
+                xTelemetryData.driver_faults = 0U;
             }
             else if( raw[ 0 ] == CALIBRATION_CMD_DRIVE_ENABLE_OFF )
             {
@@ -351,6 +389,8 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
                           canMESSAGE_BOX20, canMESSAGE_BOX22 );
         vPollDriverNode( 1U, canMESSAGE_BOX15, canMESSAGE_BOX17, canMESSAGE_BOX19,
                           canMESSAGE_BOX21, canMESSAGE_BOX23 );
+
+        watchdog_checkin( WATCHDOG_TASK_CAN_RX );
 
         vTaskDelay( pdMS_TO_TICKS( CAN_RX_PERIOD_MS ) );
     }
@@ -481,12 +521,75 @@ static uint8_t u8CheckSensorTimeouts( const TelemetrySnapshot_t *pxData, TickTyp
     return u8Timeouts;
 }
 
-static void vSendMainEcuErrors( bool bAppsBrakeFault, uint8_t u8SensorTimeouts )
+/* True if xTick is later than xRef (wrap-safe). */
+static bool bTickAfter( TickType_t xTick, TickType_t xRef )
+{
+    return ( int32_t ) ( xTick - xRef ) > 0;
+}
+
+/* One drive's fault conditions (see DRIVER_START_GRACE_MS). xGraceEnd is
+ * the tick after which its frames count. Call with xTelemetryMutex held,
+ * only while in DRIVE and past the grace time. */
+static bool bDriverFaulted( const DriverNode_t *pxNode, TickType_t xNow, TickType_t xGraceEnd )
+{
+    if( pxNode->txpdo1_valid && bTickAfter( pxNode->txpdo1_rx_tick, xGraceEnd ) &&
+        ( ( pxNode->error != 0U ) || ( ( pxNode->status_word & STATUSWORD_FAULT_BIT ) != 0U ) ) )
+    {
+        return true;
+    }
+
+    if( !pxNode->txpdo2_valid || ( ( xNow - pxNode->txpdo2_rx_tick ) > pdMS_TO_TICKS( DRIVER_PDO_TIMEOUT_MS ) ) )
+    {
+        return true;
+    }
+
+    return false;
+}
+
+/* DRIVER_FAULT_* bits of the drives that faulted. Call with
+ * xTelemetryMutex held, only while drive is enabled. */
+static uint8_t u8CheckDriverFaults( const TelemetrySnapshot_t *pxData, TickType_t xNow, TickType_t xDriveOnTick )
+{
+    TickType_t xGraceEnd = xDriveOnTick + pdMS_TO_TICKS( DRIVER_START_GRACE_MS );
+    uint8_t u8Faults = 0U;
+
+    if( !bTickAfter( xNow, xGraceEnd ) )
+    {
+        return 0U;
+    }
+
+    if( bDriverFaulted( &pxData->driver[ 0 ], xNow, xGraceEnd ) )
+    {
+        u8Faults |= DRIVER_FAULT_LEFT;
+    }
+    if( bDriverFaulted( &pxData->driver[ 1 ], xNow, xGraceEnd ) )
+    {
+        u8Faults |= DRIVER_FAULT_RIGHT;
+    }
+
+    return u8Faults;
+}
+
+/* Brake light with hysteresis, from the fresh brake frames only. Call
+ * with xTelemetryMutex held. */
+static bool bBrakeLight( const TelemetrySnapshot_t *pxData, TickType_t xNow, bool bLightOn )
+{
+    uint16_t usThreshold = bLightOn ? BRAKE_LIGHT_OFF_PSI : BRAKE_LIGHT_ON_PSI;
+    bool bFront = !bFrameTimedOut( pxData->front_axle_valid, pxData->front_axle_rx_tick, xNow ) &&
+                  ( pxData->front_axle.front_brake > usThreshold );
+    bool bRear = !bFrameTimedOut( pxData->rear_valid, pxData->rear_rx_tick, xNow ) &&
+                 ( pxData->rear.rear_brake > usThreshold );
+
+    return bFront || bRear;
+}
+
+static void vSendMainEcuErrors( bool bAppsBrakeFault, uint8_t u8SensorTimeouts, uint8_t u8DriverFaults )
 {
     uint8 data[ 8 ] = { 0U };
 
     data[ 0 ] = bAppsBrakeFault ? 1U : 0U;
     data[ 1 ] = u8SensorTimeouts;
+    data[ 2 ] = u8DriverFaults;
     ( void ) canTransmit( canREG1, MAIN_ECU_ERRORS_MAILBOX, data );
 }
 
@@ -518,6 +621,14 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
     bool bAppsBrakeFaultSent = false;
     uint8_t u8SensorTimeouts = 0U;
     uint8_t u8SensorTimeoutsSent = 0U;
+    uint8_t u8DriverFaults = 0U;
+    uint8_t u8DriverFaultsSent = 0U;
+    bool bDriveWasEnabled = false;
+    TickType_t xDriveOnTick = 0U;
+    bool bBrakeLightOn = false;
+    bool bRtdsOn = false;
+    TickType_t xRtdsStart = 0U;
+    TickType_t xNow;
     TickType_t xLastErrorsTx = 0U;
     int16_t s16Torque[ 2 ] = { 0, 0 };
     uint16_t usControlWord;
@@ -542,8 +653,26 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
             xTelemetryData.drive_enabled = false;
         }
 
-        /* Drive on/off from 0x600 (cmd 7/8), or forced off by 0x401 or a
-         * sensor CAN timeout. */
+        /* A drive faulted or dropped out in DRIVE -> both motors stop,
+         * latched until the next cmd 7 (DRIVER_START_GRACE_MS). */
+        xNow = xTaskGetTickCount();
+        if( xTelemetryData.drive_enabled && !bDriveWasEnabled )
+        {
+            xDriveOnTick = xNow;
+        }
+        if( xTelemetryData.drive_enabled )
+        {
+            uint8_t u8NewFaults = u8CheckDriverFaults( &xTelemetryData, xNow, xDriveOnTick );
+            if( u8NewFaults != 0U )
+            {
+                xTelemetryData.driver_faults |= u8NewFaults;
+                xTelemetryData.drive_enabled = false;
+            }
+        }
+        u8DriverFaults = xTelemetryData.driver_faults;
+
+        /* Drive on/off from 0x600 (cmd 7/8), or forced off by 0x401, a
+         * sensor CAN timeout or a drive fault. */
         bDriveEnabled = xTelemetryData.drive_enabled;
 
         /* The average between APPS1 (tps1) and APPS2 (tps2), scaled to
@@ -617,7 +746,26 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
             xTelemetryData.tc_cutting[ 1 ] = false;
         }
 
+        /* Brake light (DO1) and Ready to Drive sound (DO0): the sound
+         * starts when drive actually goes on and lasts RTDS_DURATION_MS. */
+        bBrakeLightOn = bBrakeLight( &xTelemetryData, xNow, bBrakeLightOn );
+        if( bDriveEnabled && !bDriveWasEnabled )
+        {
+            bRtdsOn = true;
+            xRtdsStart = xNow;
+        }
+        if( !bDriveEnabled || ( ( xNow - xRtdsStart ) >= pdMS_TO_TICKS( RTDS_DURATION_MS ) ) )
+        {
+            bRtdsOn = false;
+        }
+        xTelemetryData.brake_light = bBrakeLightOn;
+        xTelemetryData.rtds_on = bRtdsOn;
+        bDriveWasEnabled = bDriveEnabled;
+
         xSemaphoreGive( xTelemetryMutex );
+
+        gioSetBit( DO_PORT, DO_BRAKE_LIGHT_BIT, bBrakeLightOn ? 1U : 0U );
+        gioSetBit( DO_PORT, DO_RTDS_BIT, bRtdsOn ? 1U : 0U );
 
         run_drivers( bDriveEnabled, s16Torque );
 
@@ -639,16 +787,20 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
          * then periodically while active. */
         if( ( bAppsBrakeFault != bAppsBrakeFaultSent ) ||
             ( u8SensorTimeouts != u8SensorTimeoutsSent ) ||
-            ( ( bAppsBrakeFault || ( u8SensorTimeouts != 0U ) ) &&
+            ( u8DriverFaults != u8DriverFaultsSent ) ||
+            ( ( bAppsBrakeFault || ( u8SensorTimeouts != 0U ) || ( u8DriverFaults != 0U ) ) &&
               ( ( xTaskGetTickCount() - xLastErrorsTx ) >= pdMS_TO_TICKS( MAIN_ECU_ERRORS_PERIOD_MS ) ) ) )
         {
-            vSendMainEcuErrors( bAppsBrakeFault, u8SensorTimeouts );
+            vSendMainEcuErrors( bAppsBrakeFault, u8SensorTimeouts, u8DriverFaults );
             bAppsBrakeFaultSent = bAppsBrakeFault;
             u8SensorTimeoutsSent = u8SensorTimeouts;
+            u8DriverFaultsSent = u8DriverFaults;
             xLastErrorsTx = xTaskGetTickCount();
         }
 
         vRecordLoopTime( portGET_RUN_TIME_COUNTER_VALUE() - ulLoopStart );
+
+        watchdog_checkin( WATCHDOG_TASK_DRIVERS );
 
         vTaskDelay( pdMS_TO_TICKS( DRIVERS_PERIOD_MS ) );
     }
@@ -685,6 +837,7 @@ void vApplicationGetTimerTaskMemory( StaticTask_t **ppxTimerTaskTCBBuffer,
 int main( void )
 {
     gioInit();
+    gioSetDirection( DO_PORT, DO_DIRECTION_MASK ); /* DO0/DO1 out, off (gioInit cleared DOUT) */
     canInit();
     sciInit();
     sciSetBaudrate( sciREG, 115200U );
@@ -705,6 +858,8 @@ int main( void )
 
     xTaskCreateStatic( vDriversTask, "Drivers", STACK_DRIVERS, NULL,
                         PRIO_DRIVERS, xDriversStack, &xDriversTaskBuffer );
+
+    watchdog_init( PRIO_WATCHDOG );
 
     vTaskStartScheduler();
 
