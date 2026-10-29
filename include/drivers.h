@@ -17,13 +17,15 @@ void init_drivers(void);
  * Keep @p start_requested true to execute PRE-OPERATIONAL, OPERATIONAL and
  * the CiA-402 enable sequence. Once both motors are enabled, each call sends
  * an RPDO1 torque command to each node. Set @p start_requested false to
- * disable both motors and return them to PRE-OPERATIONAL.
+ * disable both motors: RXPDO1 Shutdown with torque 0, then PRE-OPERATIONAL.
  *
  * @param start_requested State of the single start button.
  * @param torque_request Signed target torque per node ([0] = node 1/left,
  *        [1] = node 2/right), written to RPDO1 bytes 2 and 3.
+ * @return false if a frame couldn't be queued (CAN mailbox stuck, see
+ *         CANOPEN_TX_TIMEOUT_MS); the stop is retried on the next call.
  */
-void run_drivers(bool start_requested, const int16_t torque_request[2]);
+bool run_drivers(bool start_requested, const int16_t torque_request[2]);
 
 /* Last RXPDO1 sent to driver `index` (0 = left, 1 = right): control word,
  * target torque in the ECU's sign convention (+ = forward) and the tick it

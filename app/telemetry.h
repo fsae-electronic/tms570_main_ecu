@@ -24,8 +24,8 @@
 #define CAN_ID_CURRENT_DATA  0x503U /* adc2can_rear: driver AC/DC currents */
 #define CAN_ID_REAR_DATA     0x504U /* adc2can_rear: rear brake pressure */
 #define CAN_ID_CALIBRATION   0x600U /* on-board ECU: calibration command */
-#define CAN_ID_SENSOR_ERRORS 0x401U /* adc2can_front/rear, sent once per fault: B0 TPS implausibility, B1 brake implausibility */
-#define CAN_ID_MAIN_ECU_ERRORS 0x403U /* main ECU -> on-board ECU: B0 EV.4.7 APPS/brake plausibility active, B1 SENSOR_TIMEOUT_*, B2 DRIVER_FAULT_* */
+#define CAN_ID_SENSOR_ERRORS 0x401U /* adc2can_front/rear, every 50 ms while a fault lasts: B0 TPS implausibility, B1 brake implausibility */
+#define CAN_ID_MAIN_ECU_ERRORS 0x403U /* main ECU -> on-board ECU: B0 EV.4.7 APPS/brake plausibility active, B1 SENSOR_TIMEOUT_*, B2 DRIVER_FAULT_*, B3 DRIVE_REJECT_*, B4 APPS disagreement */
 #define CAN_ID_TC_CONFIG     0x6A0U /* on-board ECU: B0 TC level 0-10, B1 TC Cut level 1-10 (0xFF = keep). Not 0x601/0x602: those are the drives' SDO RX */
 
 /* Driver PDO IDs are base + node, node 1 = left, node 2 = right. */
@@ -46,6 +46,13 @@
  * Latched until the next drive-on (cmd 7). */
 #define DRIVER_FAULT_LEFT       ( 1U << 0 ) /* node 1 */
 #define DRIVER_FAULT_RIGHT      ( 1U << 1 ) /* node 2 */
+#define DRIVER_FAULT_TX         ( 1U << 2 ) /* RXPDO1 couldn't be queued for DRIVER_TX_FAIL_LIMIT loops (CAN stuck) */
+
+/* TelemetrySnapshot_t.drive_reject bits: why the last cmd 7 (drive on) was
+ * refused, 0 once one is accepted (main.c). */
+#define DRIVE_REJECT_IMPLAUSIBILITY ( 1U << 0 ) /* 0x401 still arriving */
+#define DRIVE_REJECT_APPS_DIFF      ( 1U << 1 ) /* APPS1/APPS2 more than 10 points apart, or no 0x501 yet */
+#define DRIVE_REJECT_NO_BRAKE       ( 1U << 2 ) /* brake not above BRAKE_ENGAGED_PSI (fresh 0x502/0x504) */
 
 typedef struct
 {
@@ -147,7 +154,11 @@ typedef struct
     bool            race_map_limiting; /* race map's 1/velocity fall-off active on either motor */
     bool            brake_engaged;    /* front or rear pressure above BRAKE_ENGAGED_PSI */
     bool            apps_brake_fault; /* EV.4.7 APPS / brake plausibility: motors stopped */
-    bool            sensor_fault;     /* 0x401 TPS/brake implausibility, latched until the next drive-on */
+    bool            sensor_fault;     /* 0x401 TPS/brake implausibility or APPS disagreement, latched until the next drive-on */
+    bool            implausibility_valid;    /* a 0x401 fault frame has arrived since boot */
+    TickType_t      implausibility_rx_tick;  /* last 0x401 with a fault set */
+    bool            apps_diff_fault;  /* APPS1/APPS2 disagreeing for more than APPS_DIFF_TIME_MS right now (main.c) */
+    uint8_t         drive_reject;     /* DRIVE_REJECT_* bits of the last cmd 7, 0 = accepted */
     uint8_t         sensor_timeouts;  /* SENSOR_TIMEOUT_* bits: sensor frames missing */
     uint8_t         driver_faults;    /* DRIVER_FAULT_* bits, latched until the next drive-on */
     bool            brake_light;      /* brake light output (DO1) on */

@@ -86,18 +86,50 @@ static bool send_torque(uint16_t node_id, int16_t torque)
     return canopen_send_pdo(RPDO1_BASE_ID + node_id, data);
 }
 
-static void stop_drivers(void)
+/* Drive off: first an RXPDO1 with the Shutdown control word and torque 0
+ * (Operation enabled -> Ready to switch on, power stage off at once), then
+ * NMT pre-operational. A node only counts as stopped once both frames were
+ * queued; otherwise this retries on the next call. Returns false if any
+ * frame couldn't be queued. */
+static bool stop_drivers(void)
 {
     uint32_t index;
+    bool shutdown_sent[2] = {false, false};
+    bool any_shutdown = false;
+    bool ok = true;
 
     for (index = 0U; index < 2U; index++)
     {
         if (s_drivers[index].state != DRIVER_STATE_STOP)
         {
-            send_nmt_command(NMT_CMD_ENTER_PRE_OPERATIONAL, s_drivers[index].node_id);
-            s_drivers[index].state = DRIVER_STATE_STOP;
+            shutdown_sent[index] = send_controlword(s_drivers[index].node_id, CONTROLWORD_SHUTDOWN);
+            any_shutdown = any_shutdown || shutdown_sent[index];
+            ok = ok && shutdown_sent[index];
         }
     }
+
+    if (any_shutdown)
+    {
+        /* Let the drives read the Shutdown before NMT stops their PDOs. */
+        vTaskDelay(pdMS_TO_TICKS(INIT_STEP_GAP_MS));
+    }
+
+    for (index = 0U; index < 2U; index++)
+    {
+        if (shutdown_sent[index])
+        {
+            if (send_nmt_command(NMT_CMD_ENTER_PRE_OPERATIONAL, s_drivers[index].node_id))
+            {
+                s_drivers[index].state = DRIVER_STATE_STOP;
+            }
+            else
+            {
+                ok = false;
+            }
+        }
+    }
+
+    return ok;
 }
 
 /* Runs the whole OPERATIONAL -> CiA-402 enable sequence, pacing each frame
@@ -108,7 +140,7 @@ static void advance_driver(DriverChannel_t *driver)
     {
     case DRIVER_STATE_INITIALIZING:
         // send_nmt_command(NMT_CMD_ENTER_PRE_OPERATIONAL, driver->node_id);
-        send_nmt_command(NMT_CMD_ENTER_OPERATIONAL, driver->node_id);
+        (void)send_nmt_command(NMT_CMD_ENTER_OPERATIONAL, driver->node_id);
         vTaskDelay(pdMS_TO_TICKS(INIT_STEP_GAP_MS));
         (void)send_controlword(driver->node_id, CONTROLWORD_SHUTDOWN);
         vTaskDelay(pdMS_TO_TICKS(INIT_STEP_GAP_MS));
@@ -139,20 +171,20 @@ void init_drivers(void)
      * operational with the last torque: send them all to pre-operational.
      * One broadcast frame (node 0 = all), so it can't block on a busy
      * mailbox when nothing else is on the bus. */
-    send_nmt_command(NMT_CMD_ENTER_PRE_OPERATIONAL, 0U);
+    (void)send_nmt_command(NMT_CMD_ENTER_PRE_OPERATIONAL, 0U);
 }
 
-void run_drivers(bool drive_enabled, const int16_t torque_request[2])
+bool run_drivers(bool drive_enabled, const int16_t torque_request[2])
 {
     uint32_t index;
     static TickType_t s_last_torque_tick = 0U;
     TickType_t now;
     bool send_torque_now;
+    bool ok = true;
 
     if (!drive_enabled)
     {
-        stop_drivers();
-        return;
+        return stop_drivers();
     }
 
     now = xTaskGetTickCount();
@@ -173,9 +205,11 @@ void run_drivers(bool drive_enabled, const int16_t torque_request[2])
 
         if ((s_drivers[index].state == DRIVER_STATE_DRIVE) && send_torque_now)
         {
-            (void)send_torque(s_drivers[index].node_id, (int16_t)(-1)*torque_request[index]);
+            ok = send_torque(s_drivers[index].node_id, (int16_t)(-1)*torque_request[index]) && ok;
         }
     }
+
+    return ok;
 }
 
 bool drivers_last_rxpdo1(uint32_t index, uint16_t *controlword, int16_t *torque, TickType_t *tick)

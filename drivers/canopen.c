@@ -7,6 +7,7 @@
 
 #include "canopen.h"
 #include "can.h"
+#include "FreeRTOS.h"
 
 #define CANOPEN_NMT_TX_MAILBOX canMESSAGE_BOX5
 #define CANOPEN_SDO_TX_MAILBOX canMESSAGE_BOX6
@@ -17,10 +18,29 @@
 #define CANOPEN_STANDARD_TX_ARB(id) (0x20000000U | canSTD_ID(id))
 #define CANOPEN_STANDARD_RX_ARB(id) (canSTD_ID(id))
 
+/* Longest wait for the previous frame of a mailbox to go out. A frame takes
+ * ~0.13 ms at 1 Mbit/s; if it is still pending after this the bus is stuck
+ * (bus-off, nobody acking) and the send is dropped instead of hanging the
+ * caller (the drivers task). The time comes from RTI counter 1, which only
+ * runs once the scheduler started, so CANOPEN_TX_MAX_POLLS also bounds the
+ * wait before that (init_drivers()). */
+#define CANOPEN_TX_TIMEOUT_MS 2U
+#define CANOPEN_TX_TIMEOUT_COUNTS ((RUN_TIME_COUNTER_HZ / 1000U) * CANOPEN_TX_TIMEOUT_MS)
+#define CANOPEN_TX_MAX_POLLS 100000U
+
 static bool canopen_transmit(uint32 mailbox, uint16_t id, const uint8_t *data)
 {
+	uint32_t start = portGET_RUN_TIME_COUNTER_VALUE();
+	uint32_t polls = 0U;
+
 	while (canIsTxMessagePending(canREG1, mailbox) != 0U)
 	{
+		polls++;
+		if (((portGET_RUN_TIME_COUNTER_VALUE() - start) > CANOPEN_TX_TIMEOUT_COUNTS) ||
+			(polls > CANOPEN_TX_MAX_POLLS))
+		{
+			return false;
+		}
 	}
 
 	canUpdateID(canREG1, mailbox, CANOPEN_STANDARD_TX_ARB(id));
@@ -197,10 +217,10 @@ int32_t recive_sdo_read_command(uint8_t command, uint16_t od_index, uint8_t od_s
  * @param node_id Node ID of the slave
  * @return void
  */
-void send_nmt_command(uint8_t command, uint16_t node_id) {
+bool send_nmt_command(uint8_t command, uint16_t node_id) {
 	uint8_t nmt_data[8] = {0U};
 	nmt_data[0] = command; // NMT command (0x01 for Operational, 0x80 for Pre-operational)
 	nmt_data[1] = (uint8_t) node_id;  // Node ID of the slave
 
-	(void)canopen_transmit(CANOPEN_NMT_TX_MAILBOX, 0x000U, nmt_data);
+	return canopen_transmit(CANOPEN_NMT_TX_MAILBOX, 0x000U, nmt_data);
 }

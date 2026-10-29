@@ -84,8 +84,28 @@
  * every 10 ms. */
 #define SENSOR_CAN_TIMEOUT_MS   100U /* SENSOR_TIMEOUT_* bits: telemetry.h */
 
-/* 0x403 to the on-board ECU: B0 EV.4.7 active, B1 SENSOR_TIMEOUT_* bits.
- * Sent whenever either changes, and repeated every
+/* 0x401 (adc2can boards) is repeated every 50 ms while the TPS or brake
+ * implausibility lasts. A fault is taken as still active until no 0x401
+ * has arrived for IMPLAUSIBILITY_ACTIVE_MS, and cmd 7 is refused meanwhile:
+ * the driver can't re-enable drive with the pedal still implausible. */
+#define IMPLAUSIBILITY_ACTIVE_MS 200U
+
+/* T.4.2.4-5, checked here too (the front board already does it and sends
+ * 0x401): APPS1 and APPS2 from 0x501 more than APPS_DIFF_MAX_PCT points
+ * apart for more than APPS_DIFF_TIME_MS stops the motors like a 0x401
+ * (sensor_fault). cmd 7 is refused while they disagree. */
+#define APPS_DIFF_MAX_PCT       10U
+#define APPS_DIFF_TIME_MS       100U
+
+/* cmd 7 (drive on) is only accepted with the brake pressed above
+ * BRAKE_ENGAGED_PSI on a fresh 0x502 or 0x504 frame (EV.10.4), checked here
+ * as well as on the on-board ECU. A refused cmd 7 sets DRIVE_REJECT_* bits
+ * (telemetry.h) in 0x403 B3 and leaves any latched fault as it was. */
+
+/* 0x403 to the on-board ECU: B0 EV.4.7 active, B1 SENSOR_TIMEOUT_* bits,
+ * B2 DRIVER_FAULT_* bits, B3 DRIVE_REJECT_* bits of the last refused cmd 7,
+ * B4 APPS1/APPS2 disagreement (APPS_DIFF_*) active.
+ * Sent whenever any of them changes, and repeated every
  * MAIN_ECU_ERRORS_PERIOD_MS while any is active so a dashboard that missed
  * the edge (or booted late) still shows it. */
 #define MAIN_ECU_ERRORS_MAILBOX     canMESSAGE_BOX28
@@ -126,6 +146,11 @@
 #define DRIVER_PDO_TIMEOUT_MS   100U
 #define STATUSWORD_FAULT_BIT    0x0008U
 
+/* run_drivers() failing to queue a frame (mailbox stuck, e.g. bus-off) for
+ * this many drivers loops in a row is a drive fault too (DRIVER_FAULT_TX):
+ * the drives aren't getting the torque updates. */
+#define DRIVER_TX_FAIL_LIMIT    5U
+
 /* Motor turns per rear wheel turn: rear wheel speed = motor_velocity /
  * GEAR_RATIO, in wheel RPM like the fronts (needed for the slip ratio). */
 #define GEAR_RATIO              4
@@ -162,6 +187,44 @@ static uint32_t leU32( const uint8 *p )
 static int32_t leI32( const uint8 *p )
 {
     return ( int32_t ) leU32( p );
+}
+
+static bool bFrameTimedOut( bool bValid, TickType_t xRxTick, TickType_t xNow );
+
+/* |APPS1 - APPS2| in pedal travel points. */
+static uint16_t usAppsDiff( const SensorsData_t *pxSensors )
+{
+    return ( pxSensors->tps1 > pxSensors->tps2 ) ? ( uint16_t ) ( pxSensors->tps1 - pxSensors->tps2 )
+                                                 : ( uint16_t ) ( pxSensors->tps2 - pxSensors->tps1 );
+}
+
+/* DRIVE_REJECT_* bits that refuse a cmd 7 right now (0 = accept). Call
+ * with xTelemetryMutex held. */
+static uint8_t u8DriveOnRejectReasons( const TelemetrySnapshot_t *pxData, TickType_t xNow )
+{
+    uint8_t u8Reasons = 0U;
+
+    if( pxData->implausibility_valid &&
+        ( ( xNow - pxData->implausibility_rx_tick ) < pdMS_TO_TICKS( IMPLAUSIBILITY_ACTIVE_MS ) ) )
+    {
+        u8Reasons |= DRIVE_REJECT_IMPLAUSIBILITY;
+    }
+
+    if( !pxData->sensors_valid || ( usAppsDiff( &pxData->sensors ) > APPS_DIFF_MAX_PCT ) )
+    {
+        u8Reasons |= DRIVE_REJECT_APPS_DIFF;
+    }
+
+    /* Same threshold as bBrakeEngaged(), but only on fresh frames. */
+    if( !( ( !bFrameTimedOut( pxData->front_axle_valid, pxData->front_axle_rx_tick, xNow ) &&
+             ( pxData->front_axle.front_brake > BRAKE_ENGAGED_PSI ) ) ||
+           ( !bFrameTimedOut( pxData->rear_valid, pxData->rear_rx_tick, xNow ) &&
+             ( pxData->rear.rear_brake > BRAKE_ENGAGED_PSI ) ) ) )
+    {
+        u8Reasons |= DRIVE_REJECT_NO_BRAKE;
+    }
+
+    return u8Reasons;
 }
 
 /* ---- Task storage ---------------------------------------------------*/
@@ -317,9 +380,15 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
             xTelemetryData.calibration_rx_tick = xTaskGetTickCount();
             if( raw[ 0 ] == CALIBRATION_CMD_DRIVE_ENABLE_ON )
             {
-                xTelemetryData.drive_enabled = true;
-                xTelemetryData.sensor_fault = false;
-                xTelemetryData.driver_faults = 0U;
+                uint8_t u8Reject = u8DriveOnRejectReasons( &xTelemetryData, xTaskGetTickCount() );
+
+                xTelemetryData.drive_reject = u8Reject;
+                if( u8Reject == 0U )
+                {
+                    xTelemetryData.drive_enabled = true;
+                    xTelemetryData.sensor_fault = false;
+                    xTelemetryData.driver_faults = 0U;
+                }
             }
             else if( raw[ 0 ] == CALIBRATION_CMD_DRIVE_ENABLE_OFF )
             {
@@ -370,10 +439,11 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
         }
 
         /* CAN ID 0x401: TPS / brake implausibility, detected by the
-         * adc2can boards and sent once per fault. Stop the car by forcing
-         * drive off, exactly as if cmd 8 had arrived -- it stays stopped
-         * until the on-board ECU sends a new drive-on (cmd 7). Polled after
-         * 0x600 so a fault wins over a drive-on in the same cycle. */
+         * adc2can boards and repeated every 50 ms while it lasts. Stop the
+         * car by forcing drive off, exactly as if cmd 8 had arrived -- it
+         * stays stopped until a new drive-on (cmd 7), which is refused
+         * while 0x401 keeps arriving (IMPLAUSIBILITY_ACTIVE_MS). Polled
+         * after 0x600 so a fault wins over a drive-on in the same cycle. */
         if( canGetData( canREG1, canMESSAGE_BOX27, raw ) != 0U )
         {
             if( ( raw[ 0 ] != 0U ) || ( raw[ 1 ] != 0U ) )
@@ -381,6 +451,8 @@ static portTASK_FUNCTION( vCanRxTask, pvParameters )
                 xSemaphoreTake( xTelemetryMutex, portMAX_DELAY );
                 xTelemetryData.drive_enabled = false;
                 xTelemetryData.sensor_fault = true;
+                xTelemetryData.implausibility_valid = true;
+                xTelemetryData.implausibility_rx_tick = xTaskGetTickCount();
                 xSemaphoreGive( xTelemetryMutex );
             }
         }
@@ -583,13 +655,16 @@ static bool bBrakeLight( const TelemetrySnapshot_t *pxData, TickType_t xNow, boo
     return bFront || bRear;
 }
 
-static void vSendMainEcuErrors( bool bAppsBrakeFault, uint8_t u8SensorTimeouts, uint8_t u8DriverFaults )
+static void vSendMainEcuErrors( bool bAppsBrakeFault, uint8_t u8SensorTimeouts, uint8_t u8DriverFaults,
+                                uint8_t u8DriveReject, bool bAppsDiffFault )
 {
     uint8 data[ 8 ] = { 0U };
 
     data[ 0 ] = bAppsBrakeFault ? 1U : 0U;
     data[ 1 ] = u8SensorTimeouts;
     data[ 2 ] = u8DriverFaults;
+    data[ 3 ] = u8DriveReject;
+    data[ 4 ] = bAppsDiffFault ? 1U : 0U;
     ( void ) canTransmit( canREG1, MAIN_ECU_ERRORS_MAILBOX, data );
 }
 
@@ -623,6 +698,13 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
     uint8_t u8SensorTimeoutsSent = 0U;
     uint8_t u8DriverFaults = 0U;
     uint8_t u8DriverFaultsSent = 0U;
+    uint8_t u8DriveReject = 0U;
+    uint8_t u8DriveRejectSent = 0U;
+    bool bAppsDiff = false;
+    bool bAppsDiffFault = false;
+    bool bAppsDiffFaultSent = false;
+    TickType_t xAppsDiffStart = 0U;
+    uint32_t ulTxFailures = 0U;
     bool bDriveWasEnabled = false;
     TickType_t xDriveOnTick = 0U;
     bool bBrakeLightOn = false;
@@ -669,7 +751,43 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
                 xTelemetryData.drive_enabled = false;
             }
         }
+        /* T.4.2.4-5 in the main ECU too: APPS disagreeing for more than
+         * APPS_DIFF_TIME_MS stops the motors like a 0x401 (sensor_fault,
+         * latched until a cmd 7, which is refused while they disagree). */
+        if( xTelemetryData.sensors_valid && ( usAppsDiff( &xTelemetryData.sensors ) > APPS_DIFF_MAX_PCT ) )
+        {
+            if( !bAppsDiff )
+            {
+                bAppsDiff = true;
+                xAppsDiffStart = xNow;
+            }
+            if( ( xNow - xAppsDiffStart ) > pdMS_TO_TICKS( APPS_DIFF_TIME_MS ) )
+            {
+                bAppsDiffFault = true;
+                xTelemetryData.sensor_fault = true;
+                xTelemetryData.drive_enabled = false;
+            }
+        }
+        else
+        {
+            bAppsDiff = false;
+            bAppsDiffFault = false;
+        }
+        xTelemetryData.apps_diff_fault = bAppsDiffFault;
+
+        /* Torque frames that couldn't be queued (see DRIVER_TX_FAIL_LIMIT). */
+        if( ulTxFailures >= DRIVER_TX_FAIL_LIMIT )
+        {
+            if( xTelemetryData.drive_enabled )
+            {
+                xTelemetryData.driver_faults |= DRIVER_FAULT_TX;
+                xTelemetryData.drive_enabled = false;
+            }
+            ulTxFailures = 0U;
+        }
+
         u8DriverFaults = xTelemetryData.driver_faults;
+        u8DriveReject = xTelemetryData.drive_reject;
 
         /* Drive on/off from 0x600 (cmd 7/8), or forced off by 0x401, a
          * sensor CAN timeout or a drive fault. */
@@ -767,7 +885,14 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
         gioSetBit( DO_PORT, DO_BRAKE_LIGHT_BIT, bBrakeLightOn ? 1U : 0U );
         gioSetBit( DO_PORT, DO_RTDS_BIT, bRtdsOn ? 1U : 0U );
 
-        run_drivers( bDriveEnabled, s16Torque );
+        if( run_drivers( bDriveEnabled, s16Torque ) || !bDriveEnabled )
+        {
+            ulTxFailures = 0U;
+        }
+        else
+        {
+            ulTxFailures++;
+        }
 
         /* What actually went out on RXPDO1, for telemetry. */
         for( n = 0U; n < 2U; n++ )
@@ -788,13 +913,17 @@ static portTASK_FUNCTION( vDriversTask, pvParameters )
         if( ( bAppsBrakeFault != bAppsBrakeFaultSent ) ||
             ( u8SensorTimeouts != u8SensorTimeoutsSent ) ||
             ( u8DriverFaults != u8DriverFaultsSent ) ||
-            ( ( bAppsBrakeFault || ( u8SensorTimeouts != 0U ) || ( u8DriverFaults != 0U ) ) &&
+            ( u8DriveReject != u8DriveRejectSent ) ||
+            ( bAppsDiffFault != bAppsDiffFaultSent ) ||
+            ( ( bAppsBrakeFault || ( u8SensorTimeouts != 0U ) || ( u8DriverFaults != 0U ) || bAppsDiffFault ) &&
               ( ( xTaskGetTickCount() - xLastErrorsTx ) >= pdMS_TO_TICKS( MAIN_ECU_ERRORS_PERIOD_MS ) ) ) )
         {
-            vSendMainEcuErrors( bAppsBrakeFault, u8SensorTimeouts, u8DriverFaults );
+            vSendMainEcuErrors( bAppsBrakeFault, u8SensorTimeouts, u8DriverFaults, u8DriveReject, bAppsDiffFault );
             bAppsBrakeFaultSent = bAppsBrakeFault;
             u8SensorTimeoutsSent = u8SensorTimeouts;
             u8DriverFaultsSent = u8DriverFaults;
+            u8DriveRejectSent = u8DriveReject;
+            bAppsDiffFaultSent = bAppsDiffFault;
             xLastErrorsTx = xTaskGetTickCount();
         }
 

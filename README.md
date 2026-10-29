@@ -77,9 +77,13 @@ IMD and BMS are hardware and stay outside this board, as the rules require.
   live from the dashboard with two levels (TC 0-10, TC Cut 1-10).
 - **Safety checks:**
   - EV.4.7 APPS / brake plausibility.
-  - APPS and brake implausibility reported by the adc2can boards.
+  - APPS and brake implausibility reported by the adc2can boards, plus its
+    own APPS1/APPS2 10 % check.
+  - Drive-on refused while a fault is still active or without brake.
   - 100 ms timeouts on the APPS and brake frames.
   - A fault or dropout of either drive stops both motors.
+  - CAN sends to the drives can't hang the task (2 ms timeout), and drive
+    off sends Shutdown + torque 0 before NMT pre-operational.
   - Hardware watchdog (RTI DWD): a hung task or CPU resets the MCU.
 - **Ready to Drive sound** (DO0) and **brake light** (DO1) outputs.
 - **Fault reporting** to the dashboard on CAN ID 0x403.
@@ -173,7 +177,7 @@ against the team's "Mensajes CAN" spec and measured on the car.
 | `0x502` | adc2can_front | 2 | B0-1 front-left wheel rpm, B2-3 front-right wheel rpm, B4-5 steering (raw), B6-7 front brake pressure (psi). Every 10 ms |
 | `0x503` | adc2can_rear | 12 | B0-1 AC current 1, B2-3 AC current 2, B4-5 DC current 1, B6-7 DC current 2 (raw) |
 | `0x504` | adc2can_rear | 13 | B0-1 rear brake pressure (psi). Every 10 ms |
-| `0x401` | adc2can boards | 27 | B0 APPS implausibility, B1 brake implausibility. Sent once per fault |
+| `0x401` | adc2can boards | 27 | B0 APPS implausibility, B1 brake implausibility. Sent when the fault is confirmed, then every 50 ms while it lasts |
 | `0x600` | on-board ECU | 24 | B0 command id, B1 value (see [Commands](#commands-0x600)) |
 | `0x6A0` | on-board ECU | 29 | B0 TC level 0-10, B1 TC Cut level 1-10. A byte out of range (e.g. `0xFF`) keeps the current level |
 | `0x181` / `0x182` | drives (TXPDO1) | 14 / 15 | Status word, warnings, error. Every 500 ms |
@@ -187,7 +191,7 @@ against the team's "Mensajes CAN" spec and measured on the car.
 |---|---|---|
 | `0x000` | drives | NMT: `0x01` operational, `0x80` pre-operational |
 | `0x201` / `0x202` | drives (RXPDO1) | B0-1 control word, B2-3 target torque (per mille of rated torque, int16). Every 10 ms in DRIVE. The wire sign is inverted (`-torque`) to match how the motors are mounted |
-| `0x403` | on-board ECU | B0 = 1 while EV.4.7 is active. B1 = sensor timeout bits: bit 0 `0x501`, bit 1 `0x502`, bit 2 `0x504`. B2 = drive fault bits: bit 0 left (node 1), bit 1 right (node 2). Sent on every change, then every 100 ms while any fault is active |
+| `0x403` | on-board ECU | B0 = 1 while EV.4.7 is active. B1 = sensor timeout bits: bit 0 `0x501`, bit 1 `0x502`, bit 2 `0x504`. B2 = drive fault bits: bit 0 left (node 1), bit 1 right (node 2), bit 2 RXPDO1 couldn't be sent. B3 = why the last `0x07` was refused (0 = accepted): bit 0 `0x401` still active, bit 1 APPS1/APPS2 > 10 points apart, bit 2 no brake. B4 = 1 while APPS1/APPS2 disagree (Main ECU check). Sent on every change, then every 100 ms while any fault is active |
 | `0x610` | on-board ECU | B0 1 = charging / 0 = not charging, B1 charger status flags. Every 500 ms while charging, plus once when charging stops |
 | `0x611` | on-board ECU | B0-1 commanded voltage, B2-3 commanded current, B4-5 measured voltage, B6-7 measured current (all 0.1 V or 0.1 A per bit). Every 500 ms while charging |
 
@@ -206,8 +210,8 @@ Byte 0 of `0x600`, the same values as the on-board ECU's
 | B0 | Action |
 |---|---|
 | `0x01`-`0x06` | Sensor calibrations for the adc2can boards (ignored here) |
-| `0x07` | **Drive ON.** Clears a latched 0x401 or drive fault and starts the drive enable sequence |
-| `0x08` | **Drive OFF.** Drives go back to pre-operational |
+| `0x07` | **Drive ON.** Refused (reason in `0x403` B3) if a `0x401` arrived in the last 200 ms, APPS1/APPS2 are more than 10 points apart, or neither brake reads > 50 psi on a fresh frame. Otherwise clears a latched 0x401 or drive fault and starts the drive enable sequence |
+| `0x08` | **Drive OFF.** Shutdown + torque 0 on RXPDO1, then pre-operational |
 | `0x09` / `0x0A` | Traction control ON / OFF |
 | `0x0B` / `0x0C` | Normal mode / race mode |
 | `0x0D` / `0x0E` | Telemetry stream ON / OFF |
@@ -250,11 +254,31 @@ drive, with 5 ms between frames:
 After that it sends `0x000F` + target torque on RXPDO1 every **10 ms**,
 the same period as the drivers task, so every traction control update
 reaches the drives.
-When drive is disabled, both nodes get NMT **pre-operational**.
+When drive is disabled, each node gets RXPDO1 with control word `0x0006`
+(Shutdown) and torque 0, which turns the power stage off at once, and 5 ms
+later NMT **pre-operational**. If a frame can't be queued, the stop is
+retried every 10 ms until both went out.
+
+Every CANopen send waits at most **2 ms** (`CANOPEN_TX_TIMEOUT_MS`,
+`drivers/canopen.c`) for the mailbox's previous frame to go out. With the
+bus stuck (bus-off, nobody acking) the send is dropped instead of hanging
+the drivers task. If the torque frames fail for 5 loops in a row (50 ms),
+drive is forced off with `0x403` B2 bit 2. With the bus stuck no frame
+reaches the drives either way, so the drives' own RPDO timeout is still the
+last protection: set it on the emDrive side.
 
 Every fault forces drive **off**. Getting back needs a new drive-on
 (`0x07`), which the dashboard only sends with the brake pressed and the
-start button pushed.
+start button pushed. The Main ECU checks it again and refuses it (reason in
+`0x403` B3, latched faults stay latched) when:
+
+- a `0x401` arrived in the last **200 ms**: the adc2can boards repeat it
+  every 50 ms while the fault lasts, so the pedal or brake sensor is still
+  implausible;
+- APPS1 and APPS2 on `0x501` are more than **10 points** apart (or no
+  `0x501` yet);
+- neither the front nor the rear brake reads more than **50 psi** on a
+  frame younger than 100 ms (EV.10.4).
 
 ### Safety checks (every 10 ms)
 
@@ -264,9 +288,16 @@ start button pushed.
    are reported in `0x403` B1. A corrupted frame is dropped by the CAN CRC
    and ends up as a timeout.
 2. **APPS / brake implausibility (T.4.2.5, T.4.3.3).** The adc2can boards
-   check the 10 % APPS deviation and the sensor ranges, and send `0x401`.
-   Any non-zero byte forces drive off and latches `sensor_fault` until the
-   next `0x07`.
+   check the 10 % APPS deviation and the sensor ranges, and send `0x401`
+   when the fault is confirmed, then every 50 ms while it lasts. Any
+   non-zero byte forces drive off and latches `sensor_fault` until the next
+   accepted `0x07` (refused while `0x401` keeps arriving).
+
+   The Main ECU also checks the APPS deviation itself on `0x501`: APPS1 and
+   APPS2 more than **10 points** apart for more than **100 ms** forces drive
+   off and latches `sensor_fault` the same way (`0x403` B4 while active).
+   It's the same check as the front board's, so a frame from it that gets
+   lost doesn't leave the motors running.
 3. **EV.4.7 APPS / brake plausibility.** If the brake is engaged (front
    *or* rear pressure > **50 psi**) and the **higher** of the two APPS reads
    more than **25 %**, torque goes to 0 and drive is forced off. The fault
@@ -497,7 +528,7 @@ sent, so the radio can be configured from XCTU. Set it back to 0 afterwards.
 
 | Rule | Requirement | How it is handled | Status |
 |---|---|---|---|
-| T.4.2.4-5 | APPS deviation > 10 % for > 100 ms → stop motor power | adc2can_front detects it and sends 0x401; Main ECU forces drive off | ✅ |
+| T.4.2.4-5 | APPS deviation > 10 % for > 100 ms → stop motor power | adc2can_front detects it and repeats 0x401 while it lasts; the Main ECU also checks it on 0x501; drive forced off and drive-on refused while active | ✅ |
 | T.4.2.9-11, T.4.3.5 | Sensor failure, lost or corrupted frames, timeouts | 100 ms timeout on 0x501 / 0x502 / 0x504; CAN CRC; 0x401 | ✅ |
 | T.4.3.3 | BSE failure > 100 ms → stop motor power | 0x401 B1 + brake frame timeouts | ✅ |
 | EV.4.7 | Brake + APPS > 25 % → cut until APPS < 5 % | Main ECU, latched; restart needs a new drive-on | ✅ |
@@ -505,7 +536,7 @@ sent, so the radio can be configured from XCTU. Set it back to 0 afterwards.
 | EV.3.1.3 | Algorithms may only reduce torque | TC multiplies by (1 − cut), cut ∈ [0, max_cut] | ✅ |
 | EV.3.3.1 | 80 kW max | 75 A DC per drive (~16 kW at ~106 V) | ✅ |
 | EV.3.3.3 | No regen below 5 km/h | No regeneration at all | ✅ |
-| EV.10.6.2 | Ready to Drive only with TS active + brake + manual action | Brake + button: on-board ECU. **TS active: not checked** | ⚠️ |
+| EV.10.6.2 | Ready to Drive only with TS active + brake + manual action | Brake + button: on-board ECU, brake > 50 psi checked again by the Main ECU. **TS active: not checked** | ⚠️ |
 | EV.10.7 | Ready to Drive sound (1-3 s, ≥ 80 dBA) | DO0 on for 2 s at drive-on. Loudness depends on the buzzer | ✅ |
 | T.3.4 | Brake light | DO1 from the front / rear brake pressure, 20 / 10 psi hysteresis | ✅ |
 
@@ -526,6 +557,10 @@ sent, so the radio can be configured from XCTU. Set it back to 0 afterwards.
 | `RTDS_DURATION_MS` | `app/main.c` | 2000 ms | Ready to Drive sound length (EV.10.7: 1-3 s) |
 | `BRAKE_LIGHT_ON_PSI` / `_OFF_PSI` | `app/main.c` | 20 / 10 psi | Brake light thresholds |
 | `DRIVER_START_GRACE_MS`, `DRIVER_PDO_TIMEOUT_MS` | `app/main.c` | 300 ms, 100 ms | Drive fault monitoring |
+| `DRIVER_TX_FAIL_LIMIT` | `app/main.c` | 5 | Drivers loops in a row with an RXPDO1 that couldn't be queued before it's a drive fault |
+| `IMPLAUSIBILITY_ACTIVE_MS` | `app/main.c` | 200 ms | A `0x401` this recent refuses `0x07` |
+| `APPS_DIFF_MAX_PCT`, `APPS_DIFF_TIME_MS` | `app/main.c` | 10 points, 100 ms | Main ECU APPS1/APPS2 deviation check |
+| `CANOPEN_TX_TIMEOUT_MS` | `drivers/canopen.c` | 2 ms | Longest wait for a CANopen mailbox before the send is dropped |
 | `WATCHDOG_ENABLE`, `WATCHDOG_DWD_PRELOAD` | `app/watchdog.c` | 1, 976 (~100 ms) | Hardware watchdog |
 | `CAN_RX_PERIOD_MS`, `DRIVERS_PERIOD_MS` | `app/main.c` | 10 ms | Task periods |
 | `TORQUE_SEND_PERIOD_MS` | `drivers/drivers.c` | 10 ms | RXPDO1 torque rate (keep in sync with `tools/torque_sim.py`) |

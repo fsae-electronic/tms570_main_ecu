@@ -25,7 +25,8 @@ bool canopen_read(uint16_t cob_id, uint8_t data[8]);
  * @brief Send an 8-byte CANopen PDO frame.
  * @param cob_id 11-bit CANopen PDO COB-ID.
  * @param data PDO payload.
- * @return true when the transmission was queued.
+ * @return true when the transmission was queued; false if the mailbox's
+ *         previous frame didn't go out within CANOPEN_TX_TIMEOUT_MS.
  */
 bool canopen_send_pdo(uint16_t cob_id, const uint8_t data[8]);
 ////////////////////////////////////////////////////
@@ -98,7 +99,7 @@ int32_t recive_sdo_read_command(uint8_t command, uint16_t od_index, uint8_t od_s
  * 0x81 for Reset Node
  * 0x82 for Reset Communication
  * @param node_id Node ID of the slave
- * @return void
+ * @return true when the frame was queued (false: mailbox stuck, see canopen.c)
  */
 #define NMT_CMD_ENTER_OPERATIONAL     0x01U
 #define NMT_CMD_STOP                  0x02U
@@ -106,7 +107,7 @@ int32_t recive_sdo_read_command(uint8_t command, uint16_t od_index, uint8_t od_s
 #define NMT_CMD_RESET_NODE            0x81U
 #define NMT_CMD_RESET_COMMUNICATION   0x82U
 
-void send_nmt_command(uint8_t command, uint16_t node_id);
+bool send_nmt_command(uint8_t command, uint16_t node_id);
 
 
 #endif /* CAN_OPEN_H_ */
